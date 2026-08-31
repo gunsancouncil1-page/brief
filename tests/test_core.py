@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from app.services.crawler import (
 )
 from app.services.images import _normalize, body_image_urls
 from app.services.job_runner import JobRunner, is_collection_day, report_window
+from app.services.site_builder import build_site
 
 
 def make_settings(tmp_path: Path, *, auto_register: bool = False) -> Settings:
@@ -700,6 +702,61 @@ def test_public_page_points_at_the_latest_collection_only(tmp_path: Path):
 
         # 지난 날짜도 주소를 직접 치면 열리지만, 화면은 최신분만 가리킨다.
         assert client.get("/api/dates").json()["dates"] == ["2026-08-27", "2026-08-25"]
+
+
+def test_static_site_carries_only_approved_link_data(tmp_path: Path):
+    """GitHub Pages에 올릴 정적본에는 승인된 링크 정보만 담긴다."""
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+
+    published = make_job(
+        database, report_date="2026-08-25", section="council", generate_briefing=True
+    )
+    waiting = make_job(database, report_date="2026-08-25", section="cityhall", name="군산시청")
+    database.upsert_article(
+        sample_article(
+            published["id"], "a0", "https://www.jjan.kr/1", "전북일보", DISTINCT_BODIES[0],
+            title="군산시의회 임시회 개회", content_hash="hash-0",
+        )
+    )
+    database.upsert_article(
+        sample_article(
+            waiting["id"], "b0", "https://www.jjan.kr/2", "전북일보", DISTINCT_BODIES[1],
+            title="군산시 청년 지원", content_hash="hash-1",
+        )
+    )
+    database.save_briefing(published["id"], "# 한눈에 보기\n요약", "complete", "m", "2026-08-25T05:10:00Z")
+    database.set_approved(published["id"], True)  # 군산시청은 승인하지 않은 채로 둔다
+
+    site = tmp_path / "site"
+    result = build_site(database, settings, site)
+
+    assert result["dates"] == ["2026-08-25"]
+    assert (site / "index.html").is_file()
+    assert (site / "styles.css").is_file()
+    assert (site / "app.js").is_file()
+    assert (site / ".nojekyll").is_file()
+
+    index = json.loads((site / "data" / "index.json").read_text(encoding="utf-8"))
+    assert index["latest_date"] == "2026-08-25"
+    assert len(index["menu"]) == len(MENU)
+
+    payload = json.loads((site / "data" / "2026-08-25.json").read_text(encoding="utf-8"))
+    # 승인한 갈래만 실린다.
+    assert set(payload["sections"]) == {"council"}
+    article = payload["sections"]["council"]["articles"][0]
+    assert set(article) == {
+        "id", "title", "publisher", "published_at", "source_url", "matched_keywords", "preferred",
+    }
+    assert "content" not in article
+    assert payload["sections"]["council"]["briefing"]["body"].startswith("# 한눈에 보기")
+
+    # 정적 화면은 API 대신 JSON을 읽고, 관리자 링크는 싣지 않는다.
+    html = (site / "index.html").read_text(encoding="utf-8")
+    assert 'data-mode="static"' in html
+    assert './styles.css' in html and './app.js' in html
+    assert "/admin" not in html and "{{ASSET_VERSION}}" not in html
 
 
 def test_public_articles_carry_only_link_information(tmp_path: Path):
