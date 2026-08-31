@@ -8,5 +8,6 @@ node_modules/
 .wrangler/
 .gitworktrees/
 .claude/
-# 사용 설명서는 이 PC에만 둔다(GitHub에 올리지 않음)
+# 문서는 이 PC에만 둔다(GitHub에 올리지 않음)
 README.md
+docs/
