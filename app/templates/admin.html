@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="theme-color" content="#eef0ea" />
+    <title>관리자 페이지 · 군산시의회 주요 보도자료</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Serif+KR:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css?v={{ASSET_VERSION}}" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div class="masthead-rule"></div>
+        <h1>관리자 페이지</h1>
+        <div class="masthead-meta">
+          <span id="scheduleNote"></span>
+          <a href="/">결과 화면</a>
+          <a href="/health" target="_blank" rel="noreferrer">서버 상태</a>
+        </div>
+      </header>
+
+      <section id="loginCard" class="card login-card" hidden>
+        <p class="eyebrow">Sign in</p>
+        <h2 class="card-title">관리자 로그인</h2>
+        <p class="card-note"><code>.env</code>의 <code>ADMIN_API_KEY</code> 값을 입력하세요.</p>
+        <form id="loginForm" class="login-form" autocomplete="off">
+          <input id="adminKey" class="field" type="password" placeholder="관리자 키" autocomplete="current-password" required />
+          <button class="btn btn-primary" type="submit">로그인</button>
+        </form>
+        <p id="loginError" class="hint error" hidden></p>
+      </section>
+
+      <div id="adminMain" hidden>
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <h2 class="card-title">전체 등록</h2>
+            </div>
+            <div class="actions">
+              <button class="btn" type="button" id="registerAll">선택 날짜 전체 등록</button>
+              <button class="btn btn-danger" type="button" id="logoutButton">로그아웃</button>
+            </div>
+          </div>
+
+          <form id="jobForm" class="form" autocomplete="off">
+            <div class="field-row">
+              <label class="field-label" for="reportDate">기준일</label>
+              <input class="field" type="date" id="reportDate" required />
+              <p class="hint" id="windowPreview"></p>
+            </div>
+
+            <div class="field-row">
+              <span class="field-label">메뉴</span>
+              <div class="section-picker" id="sectionPicker"></div>
+            </div>
+
+            <div class="field-row">
+              <span class="field-label">검색 키워드</span>
+              <div class="chips" id="selectedChips"></div>
+              <div class="inline-fields">
+                <input class="field" type="text" id="keywordInput" placeholder="키워드 추가 후 Enter" maxlength="40" />
+                <button class="btn" type="button" id="addKeyword">추가</button>
+                <button class="btn" type="button" id="resetKeywords">기본값 복원</button>
+              </div>
+              <p class="hint">선택한 키워드가 제목·본문에 실제로 들어 있는 기사만 저장합니다.</p>
+            </div>
+
+            <div class="field-row">
+              <label class="field-label" for="excludeInput">제외 키워드</label>
+              <div class="chips" id="excludeChips"></div>
+              <div class="inline-fields">
+                <input class="field" type="text" id="excludeInput" placeholder="제외할 키워드" maxlength="40" />
+                <button class="btn" type="button" id="addExclude">추가</button>
+              </div>
+            </div>
+
+            <p class="query-preview" id="queryPreview"></p>
+
+            <div class="form-footer">
+              <button class="btn btn-primary" type="submit" id="submitJob">등록</button>
+              <label class="checkbox"><input type="checkbox" id="generateBriefing" checked /> AI 브리핑 생성</label>
+              <span class="hint" id="formMessage"></span>
+            </div>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <div>
+              <p class="eyebrow">Registered</p>
+              <h2 class="card-title">등록된 수집</h2>
+            </div>
+            <div class="actions">
+              <button class="btn" type="button" id="runDueButton">밀린 수집 실행</button>
+              <button class="btn" type="button" id="refreshButton">새로고침</button>
+            </div>
+          </div>
+          <div id="jobList"></div>
+        </section>
+
+        <section class="card" id="reviewCard" hidden>
+          <div class="card-head">
+            <div>
+              <p class="eyebrow">Review</p>
+              <h2 class="card-title" id="reviewTitle">스크랩 검토</h2>
+              <p class="card-note" id="reviewNote"></p>
+            </div>
+            <div class="actions">
+              <button class="btn" type="button" id="resetOrder">기본 순서</button>
+              <button class="btn" type="button" id="selectAll">전체 선택</button>
+              <button class="btn" type="button" id="clearAll">전체 해제</button>
+              <button class="btn" type="button" id="closeReview">닫기</button>
+            </div>
+          </div>
+          <p class="hint">체크를 해제한 기사는 공개 화면과 AI 브리핑에서 빠집니다. ↑↓ 버튼으로 공개 화면에 실릴 차례를 정할 수 있습니다.</p>
+          <div id="reviewList"></div>
+          <div class="form-footer">
+            <button class="btn btn-primary" type="button" id="approveButton">승인하고 공개</button>
+            <span class="hint" id="reviewMessage"></span>
+          </div>
+        </section>
+      </div>
+
+      <footer class="page-footer">
+        <span>수집 결과에는 원문 출처와 시각이 함께 보관됩니다.</span>
+        <span>Local-only dashboard</span>
+      </footer>
+    </main>
+    <script src="/static/admin.js?v={{ASSET_VERSION}}" defer></script>
+  </body>
+</html>

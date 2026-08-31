@@ -1,0 +1,10 @@
+name = "gunsan-brief-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-08-25"
+workers_dev = true
+
+# A stable public hostname connected to the PC through a NAMED Cloudflare Tunnel.
+# This is not a secret, but it must be changed before deploy.
+[vars]
+ORIGIN_URL = "https://brief-origin.example.com"
+

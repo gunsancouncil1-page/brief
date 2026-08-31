@@ -1,0 +1,833 @@
+import asyncio
+import re
+from datetime import date, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from fastapi.testclient import TestClient
+
+from app.config import Settings
+from app.database import Database
+from app.main import create_app
+from app.sections import LOCAL_PRESS, MENU, SECTIONS
+from app.security import issue_session, verify_session
+from app.services.briefing import strip_dropped_sections
+from app.services.crawler import (
+    DuplicateDetector,
+    SearchSpec,
+    _google_article_tokens,
+    is_google_news,
+    match_keywords,
+)
+from app.services.images import _normalize, body_image_urls
+from app.services.job_runner import JobRunner, is_collection_day, report_window
+
+
+def make_settings(tmp_path: Path, *, auto_register: bool = False) -> Settings:
+    return Settings(
+        host="127.0.0.1",
+        port=8000,
+        timezone=ZoneInfo("Asia/Seoul"),
+        data_dir=tmp_path / "storage",
+        schedule_enabled=False,
+        auto_register=auto_register,
+        admin_api_key="test-key",
+        admin_session_hours=1,
+        origin_shared_secret="",
+        ollama_url="http://127.0.0.1:11434",
+        ollama_model="test-model",
+        ollama_timeout_seconds=1,
+        rss_enabled=False,
+        images_enabled=True,
+        request_timeout_seconds=1,
+        user_agent="test",
+    )
+
+
+def make_job(database: Database, **overrides) -> dict:
+    payload = {
+        "report_date": "2026-08-25",
+        "section": "council",
+        "name": "군산시의회",
+        "keywords": ["군산시의회"],
+        "exclude_keywords": [],
+        "sites": [],
+        "preferred_sites": [],
+        "match_mode": "any",
+        "generate_briefing": False,
+        "window_start": "2026-08-24T09:00:00+09:00",
+        "window_end": "2026-08-25T05:00:00+09:00",
+    }
+    payload.update(overrides)
+    return database.create_job(**payload)
+
+
+def sample_article(
+    job_id: str,
+    article_id: str,
+    url: str,
+    publisher: str,
+    content: str,
+    *,
+    title: str = "군산시의회, 지역 현안 논의",
+    content_hash: str = "same-content",
+) -> dict:
+    return {
+        "id": article_id,
+        "job_id": job_id,
+        "report_date": "2026-08-25",
+        "title": title,
+        "publisher": publisher,
+        "source_url": url,
+        "published_at": "2026-08-24T11:00:00+09:00",
+        "scraped_at": "2026-08-24T12:00:00+09:00",
+        "summary": content[:40],
+        "content": content,
+        "content_hash": content_hash,
+        "matched_keywords": ["군산시의회"],
+        "preferred": 0,
+        "duplicate_of": None,
+    }
+
+
+def test_window_is_previous_day_nine_to_current_day_five():
+    # 2026-08-25는 화요일. 평일은 전날 09:00부터다.
+    start, end = report_window(date(2026, 8, 25), ZoneInfo("Asia/Seoul"))
+    assert start.isoformat() == "2026-08-24T09:00:00+09:00"
+    assert end.isoformat() == "2026-08-25T05:00:00+09:00"
+
+
+def test_monday_window_reaches_back_to_friday():
+    seoul = ZoneInfo("Asia/Seoul")
+    monday = date(2026, 8, 31)
+    assert monday.weekday() == 0
+    start, end = report_window(monday, seoul)
+    # 금요일 09:00부터 월요일 05:00까지 = 금·토·일 사흘치
+    assert start.isoformat() == "2026-08-28T09:00:00+09:00"
+    assert end.isoformat() == "2026-08-31T05:00:00+09:00"
+    assert (end - start).days == 2
+
+
+def test_weekends_are_not_collection_days():
+    assert is_collection_day(date(2026, 8, 28)) is True   # 금
+    assert is_collection_day(date(2026, 8, 29)) is False  # 토
+    assert is_collection_day(date(2026, 8, 30)) is False  # 일
+    assert is_collection_day(date(2026, 8, 31)) is True   # 월
+
+
+def test_weekdays_register_themselves(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    runner = JobRunner(database, settings)
+
+    monday = date(2026, 8, 31)
+    created = runner.ensure_registered(monday)
+    assert set(created) == set(SECTIONS)
+
+    jobs = {job["section"]: job for job in database.jobs(report_date="2026-08-31")}
+    # 갈래 기본 조건이 그대로 들어간다.
+    assert jobs["cityhall"]["exclude_keywords"] == ["군산시의회"]
+    assert jobs["broadcast"]["sites"] == list(SECTIONS["broadcast"].sites)
+    assert jobs["council"]["preferred_sites"] == list(LOCAL_PRESS)
+    # 월요일이므로 금요일 09:00부터다.
+    assert jobs["council"]["window_start"] == "2026-08-28T09:00:00+09:00"
+
+    # 이미 등록된 날짜는 건드리지 않는다.
+    assert runner.ensure_registered(monday) == []
+
+    # 주말은 등록하지 않는다.
+    assert runner.ensure_registered(date(2026, 8, 29)) == []
+    assert runner.ensure_registered(date(2026, 8, 30)) == []
+    assert database.jobs(report_date="2026-08-29") == []
+
+
+def test_admin_edits_survive_auto_registration(tmp_path: Path):
+    """관리자가 고쳐 둔 조건은 자동 등록이 덮어쓰지 않는다."""
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    runner = JobRunner(database, settings)
+
+    make_job(database, report_date="2026-09-01", section="council", keywords=["군산시의회", "예산"])
+    created = runner.ensure_registered(date(2026, 9, 1))
+
+    assert "council" not in created
+    council = database.job_for_section("2026-09-01", "council")
+    assert council["keywords"] == ["군산시의회", "예산"]
+
+
+def test_server_registers_todays_collection_on_startup(tmp_path: Path):
+    """자동 등록이 켜져 있으면 관리자가 손대지 않아도 오늘 몫이 등록된다."""
+    settings = make_settings(tmp_path, auto_register=True)
+    with TestClient(create_app(settings)):
+        pass
+
+    database = Database(settings.database_path)
+    today = datetime.now(settings.timezone).date()
+    registered = {job["section"] for job in database.jobs(report_date=today.isoformat())}
+    if is_collection_day(today):
+        assert registered == set(SECTIONS)
+    else:
+        assert registered == set()  # 주말에는 등록하지 않는다
+
+
+def test_weekend_jobs_are_refused(tmp_path: Path):
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        for weekend in ("2026-08-29", "2026-08-30"):
+            single = client.post(
+                "/api/admin/jobs", json={"report_date": weekend, "section": "council"}
+            )
+            assert single.status_code == 400
+            assert "토요일" in single.json()["detail"]
+            assert client.post("/api/admin/jobs/bulk", json={"report_date": weekend}).status_code == 400
+
+        assert client.post(
+            "/api/admin/jobs/bulk", json={"report_date": "2026-08-31"}
+        ).status_code == 201
+
+
+def test_broadcast_section_is_restricted_to_the_stations():
+    section = SECTIONS["broadcast"]
+    assert [tab.label for tab in MENU] == [
+        "군산시의회 AI 브리핑",
+        "군산시의회",
+        "군산시청 AI 브리핑",
+        "군산시청",
+        "방송소식",
+        "타의회 보도자료",
+    ]
+    assert set(section.sites) == {"news.kbs.co.kr", "jmbc.co.kr", "jtv.co.kr", "kcn.tv"}
+
+    spec = SearchSpec(keywords=("군산",), sites=section.sites)
+    assert spec.query.startswith("(site:news.kbs.co.kr OR ")
+    assert '"군산"' in spec.query
+
+    assert spec.matches_site("https://news.kbs.co.kr/news/view.do?ncd=1")
+    assert spec.matches_site("https://www.jmbc.co.kr/news/view/1")
+    assert spec.matches_site("http://kcn.tv/news/1")
+    # 다른 매체가 같은 내용을 전재해도 방송소식에는 들어오지 않는다.
+    assert not spec.matches_site("https://www.jbcj.kr/news/articleView.html?idxno=1")
+    assert not spec.matches_site("https://news.kbs.co.kr.evil.example/news/1")
+    # 매체를 지정하지 않은 갈래는 모두 통과한다.
+    assert SearchSpec(keywords=("군산시의회",)).matches_site("https://any.example/1")
+
+
+def test_local_press_is_searched_separately_and_listed_first(tmp_path: Path):
+    for key in ("council", "cityhall"):
+        assert SECTIONS[key].preferred_sites == LOCAL_PRESS
+        # 우선 매체는 걸러내는 조건이 아니다. 다른 매체 기사도 함께 담는다.
+        assert SECTIONS[key].sites == ()
+    assert "todaygunsan.co.kr" in LOCAL_PRESS and "jjan.kr" in LOCAL_PRESS
+
+    spec = SearchSpec(keywords=("군산시의회",), preferred_sites=LOCAL_PRESS)
+    queries = spec.queries
+    assert len(queries) == 2
+    assert queries[0].startswith("(site:") and '"군산시의회"' in queries[0]
+    assert queries[1] == '"군산시의회"'
+
+    assert spec.is_preferred("https://www.todaygunsan.co.kr/news/1")
+    assert not spec.is_preferred("https://www.chosun.com/news/1")
+    assert not spec.is_preferred("https://todaygunsan.co.kr.evil.example/1")
+
+    # 목록에서 지역 매체가 앞에 온다.
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database, preferred_sites=list(LOCAL_PRESS))
+    outside = sample_article(job["id"], "outside", "https://a.example/1", "서울신문", DISTINCT_BODIES[0])
+    local = sample_article(job["id"], "local", "https://www.todaygunsan.co.kr/1", "투데이 군산", DISTINCT_BODIES[1])
+    local["preferred"] = 1
+    local["content_hash"] = "hash-local"
+    database.upsert_article(outside)
+    database.upsert_article(local)
+
+    listed = database.articles(job["id"])
+    assert [article["id"] for article in listed] == ["local", "outside"]
+    assert listed[0]["preferred"] is True and listed[1]["preferred"] is False
+
+
+def test_duplicates_keep_the_local_paper_version(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database, preferred_sites=list(LOCAL_PRESS))
+    body = "군산시의회가 같은 보도자료를 배포해 여러 곳에 실렸다. " * 12
+    # 외부 매체 판본이 사진이 더 많아도 지역 매체 판본을 대표로 남긴다.
+    outside = sample_article(job["id"], "outside", "https://a.example/1", "서울신문", body)
+    local = sample_article(job["id"], "local", "https://www.jjan.kr/1", "전북일보", body)
+    local["preferred"] = 1
+    database.upsert_article(outside)
+    database.upsert_article(local)
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(png_bytes(800, 600))
+    database.replace_article_images(
+        "outside",
+        [{
+            "id": "image-1", "article_id": "outside", "source_url": "https://a.example/p.jpg",
+            "caption": "", "path": str(photo), "width": 800, "height": 600,
+            "byte_size": 4321, "position": 0,
+        }],
+    )
+
+    total, unique = DuplicateDetector().mark(database, job["id"])
+    assert (total, unique) == (2, 1)
+    assert database.articles(job["id"], unique_only=True)[0]["id"] == "local"
+
+
+def test_search_spec_builds_query_and_filters_text():
+    spec = SearchSpec(keywords=("군산시의회", "예산"), exclude_keywords=("전주시",), match_mode="any")
+    assert spec.query == '("군산시의회" OR "예산") -"전주시"'
+
+    assert match_keywords(spec, "군산시의회 임시회가 열렸다") == ["군산시의회"]
+    assert match_keywords(spec, "전주시 군산시의회 공동 행사") is None
+    assert match_keywords(spec, "군산시 축제 소식") is None
+
+    strict = SearchSpec(keywords=("군산시의회", "예산"), match_mode="all")
+    assert strict.query == '"군산시의회" "예산"'
+    assert match_keywords(strict, "군산시의회 임시회") is None
+    assert match_keywords(strict, "군산시의회 예산 심사") == ["군산시의회", "예산"]
+
+
+def test_google_news_interstitial_tokens():
+    assert is_google_news("https://news.google.com/rss/articles/CBMiXk")
+    assert not is_google_news("https://www.jbcj.kr/news/articleView.html?idxno=77050")
+
+    html = '<c-wiz data-n-a-id="CBMiXk" jscontroller="x" data-n-a-sg="Ae5Wzi" data-n-a-ts="1787810289">'
+    assert _google_article_tokens(html) == ("CBMiXk", "Ae5Wzi", "1787810289")
+    assert _google_article_tokens('<c-wiz data-n-a-id="CBMiXk">') is None
+
+
+ARTICLE_HTML = """
+<html><body>
+  <div class="header"><img src="/img/logo.png"></div>
+  <div id="ad_top"><img src="https://cdn.example.com/photo/sponsored-visual.jpg"></div>
+  <article>
+    <h1>군산시의회, 지역 현안 논의</h1>
+    <p>군산시의회는 26일 임시회를 열고 조례안을 심의했다. 경제건설위원회는 소상공인 지원 조례
+    개정안을 원안 가결했으며, 다음 달 2일 본회의에서 최종 의결할 예정이다. 의회는 이어서
+    주차장 운영 조례안도 함께 처리했다고 밝혔다. 이번 임시회는 사흘간 진행된다.</p>
+    <figure><img data-src="/news/photo/202608/77050_2930.jpg" src="data:image/gif;base64,R0lGOD"></figure>
+    <div class="ad-banner"><img src="https://cdn.example.com/news/photo/house-ad.jpg"></div>
+    <div class="sns-share"><img src="/news/photo/kakao_share_button.png"></div>
+  </article>
+</body></html>
+"""
+
+
+# 중복 판정에 걸리지 않도록 서로 다른 본문을 쓴다.
+DISTINCT_BODIES = [
+    "군산시의회 경제건설위원회가 소상공인 지원 조례 개정안을 원안 가결했다. " * 8,
+    "군산시의회 행정복지위원회가 공론화 조례안을 심의해 통과시켰다고 밝혔다. " * 8,
+    "군산시의회 의장이 구내식당을 찾아 조리원들의 노고를 격려하고 애로사항을 들었다. " * 8,
+]
+
+
+def png_bytes(width: int, height: int, color=(120, 140, 160)) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (width, height), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_body_images_exclude_ads_and_chrome():
+    urls = body_image_urls(ARTICLE_HTML, "https://news.example.com/article/1")
+
+    assert urls == ["https://news.example.com/news/photo/202608/77050_2930.jpg"]
+    joined = " ".join(urls)
+    for unwanted in ("logo", "sponsored", "house-ad", "share_button"):
+        assert unwanted not in joined
+
+
+def test_body_images_skip_known_ad_networks():
+    html = '<article><p>기사 본문</p><img src="https://pagead2.googlesyndication.com/photo/x.jpg"></article>'
+    assert body_image_urls(html, "https://news.example.com/a") == []
+
+
+def test_only_real_photos_survive_normalization():
+    assert _normalize(png_bytes(64, 64)) is None, "아이콘 크기는 제외"
+    assert _normalize(png_bytes(970, 90)) is None, "가로로 긴 배너는 제외"
+    assert _normalize(b"not-an-image") is None
+
+    normalized = _normalize(png_bytes(800, 600))
+    assert normalized is not None
+    data, width, height = normalized
+    assert (width, height) == (800, 600)
+    assert data.startswith(b"\xff\xd8"), "JPEG로 통일해 저장"
+
+    oversized = _normalize(png_bytes(2400, 1200))
+    assert oversized is not None and oversized[1] == 1600
+
+
+def test_images_are_stored_and_removed_with_the_job(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database)
+    database.upsert_article(sample_article(job["id"], "one", "https://a.example/1", "가신문", "본문"))
+
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(png_bytes(800, 600))
+    database.replace_article_images(
+        "one",
+        [
+            {
+                "id": "image-1", "article_id": "one", "source_url": "https://a.example/p.jpg",
+                "caption": "본회의장", "path": str(photo), "width": 800, "height": 600,
+                "byte_size": 4321, "position": 0,
+            }
+        ],
+    )
+
+    stored = database.articles(job["id"])[0]["images"]
+    assert [image["id"] for image in stored] == ["image-1"]
+    assert database.get_image("image-1")["job_id"] == job["id"]
+
+    # Re-running a job replaces the previous image set rather than piling up.
+    database.replace_article_images("one", [])
+    assert database.articles(job["id"])[0]["images"] == []
+    assert database.get_image("image-1") is None
+
+
+def test_dedupe_keeps_the_copy_with_more_photos(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database)
+    body = "같은 보도자료가 여러 언론사에 실렸습니다. " * 12
+    database.upsert_article(sample_article(job["id"], "plain", "https://a.example/1", "가신문", body))
+    database.upsert_article(sample_article(job["id"], "rich", "https://b.example/2", "나신문", body))
+
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(png_bytes(800, 600))
+    database.replace_article_images(
+        "rich",
+        [
+            {
+                "id": f"image-{index}", "article_id": "rich", "source_url": f"https://b.example/{index}.jpg",
+                "caption": "", "path": str(photo), "width": 800, "height": 600,
+                "byte_size": 4321, "position": index,
+            }
+            for index in range(2)
+        ],
+    )
+
+    total, unique = DuplicateDetector().mark(database, job["id"])
+    assert (total, unique) == (2, 1)
+    survivor = database.articles(job["id"], unique_only=True)[0]
+    assert survivor["id"] == "rich"
+    assert len(survivor["images"]) == 2
+
+
+def test_duplicate_detection(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database)
+    database.upsert_article(sample_article(job["id"], "one", "https://a.example/1", "가신문", "동일한 보도자료 본문입니다."))
+    database.upsert_article(sample_article(job["id"], "two", "https://b.example/2", "나신문", "동일한 보도자료 본문입니다."))
+
+    total, unique = DuplicateDetector().mark(database, job["id"])
+    assert (total, unique) == (2, 1)
+    all_articles = database.articles(job["id"])
+    assert sum(article["duplicate_of"] is not None for article in all_articles) == 1
+    assert len(database.articles(job["id"], unique_only=True)) == 1
+
+    photo = tmp_path / "photo.jpg"
+    photo.write_bytes(png_bytes(900, 600))
+    database.replace_article_images(
+        "one",
+        [
+            {
+                "id": "image-1", "article_id": "one", "source_url": "https://a.example/p.jpg",
+                "caption": "", "path": str(photo), "width": 900, "height": 600,
+                "byte_size": 5000, "position": 0,
+            }
+        ],
+    )
+    assert len(database.articles(job["id"])[0]["images"]) == 1
+
+
+def test_due_jobs_only_after_the_window_closes(tmp_path: Path):
+    database = Database(make_settings(tmp_path).database_path)
+    database.initialize()
+    job = make_job(database)
+    assert database.due_jobs("2026-08-25T04:59:00+09:00") == []
+    assert [item["id"] for item in database.due_jobs("2026-08-25T05:00:00+09:00")] == [job["id"]]
+
+    database.update_job_run(job["id"], status="complete", article_count=3, unique_count=2)
+    assert database.due_jobs("2026-08-26T05:00:00+09:00") == []
+
+
+def test_interrupted_run_returns_to_pending(tmp_path: Path):
+    database = Database(make_settings(tmp_path).database_path)
+    database.initialize()
+    job = make_job(database)
+    database.update_job_run(job["id"], status="running")
+    assert database.due_jobs("2026-08-25T05:00:00+09:00") == []
+
+    assert database.reset_interrupted_jobs() == 1
+    reset = database.get_job(job["id"])
+    assert reset["status"] == "pending"
+    assert [item["id"] for item in database.due_jobs("2026-08-25T05:00:00+09:00")] == [job["id"]]
+
+
+def test_admin_session_token_round_trip():
+    token, max_age = issue_session("test-key", 1)
+    assert max_age == 3600
+    assert verify_session("test-key", token)
+    assert not verify_session("other-key", token)
+    assert not verify_session("test-key", "9999999999.deadbeef")
+
+
+def test_public_pages_are_read_only(tmp_path: Path):
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        assert client.get("/health").json()["status"] == "ok"
+        assert client.get("/").status_code == 200
+        assert client.get("/admin").status_code == 200
+        assert client.get("/api/dates").json() == {"dates": []}
+        assert client.get("/api/jobs").json() == {"jobs": []}
+        assert client.post("/api/admin/jobs", json={"report_date": "2026-08-25", "section": "council"}).status_code == 401
+        assert client.post("/api/admin/login", json={"key": "wrong"}).status_code == 401
+
+
+def test_admin_can_register_and_delete_a_job(tmp_path: Path):
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        assert client.post("/api/admin/login", json={"key": "test-key"}).status_code == 200
+
+        created = client.post(
+            "/api/admin/jobs",
+            json={
+                "report_date": "2026-08-25",
+                "section": "council",
+                "keywords": ["군산시의회", " 군산시의회 "],
+                "exclude_keywords": ["전주시"],
+                "match_mode": "any",
+                "generate_briefing": False,
+            },
+        )
+        assert created.status_code == 201
+        job = created.json()["job"]
+        assert job["keywords"] == ["군산시의회"]
+        assert job["status"] == "pending"
+        assert job["window_start"] == "2026-08-24T09:00:00+09:00"
+        assert job["window_end"] == "2026-08-25T05:00:00+09:00"
+
+        assert client.get("/api/dates").json() == {"dates": ["2026-08-25"]}
+        assert len(client.get("/api/jobs?report_date=2026-08-25").json()["jobs"]) == 1
+
+        duplicate = client.post(
+            "/api/admin/jobs", json={"report_date": "2026-08-25", "section": "council"}
+        )
+        assert duplicate.status_code == 409
+
+        assert client.post("/api/admin/jobs", json={"report_date": "2026-08-25"}).status_code == 422
+        assert client.post(
+            "/api/admin/jobs", json={"report_date": "2026-08-25", "section": "nope"}
+        ).status_code == 422
+        overlap = client.post(
+            "/api/admin/jobs",
+            json={
+                "report_date": "2026-08-26",
+                "section": "cityhall",
+                "keywords": ["군산시"],
+                "exclude_keywords": ["군산시"],
+            },
+        )
+        assert overlap.status_code == 400
+
+        assert client.delete(f"/api/admin/jobs/{job['id']}").status_code == 200
+        assert client.get("/api/jobs").json() == {"jobs": []}
+
+
+def test_menu_pairs_briefing_tabs_with_their_sections():
+    assert [tab.view for tab in MENU] == [
+        "briefing", "articles", "briefing", "articles", "articles", "articles",
+    ]
+    assert set(SECTIONS) == {"council", "cityhall", "broadcast", "other_councils"}
+    assert SECTIONS["cityhall"].exclude_keywords == ("군산시의회",)
+    assert SECTIONS["other_councils"].has_briefing is False
+    # 전북특별자치도의회와 도내 13개 시·군의회(군산시의회 제외).
+    assert len(SECTIONS["other_councils"].keywords) == 14
+    assert "전주시의회" in SECTIONS["other_councils"].keywords
+    assert "군산시의회" not in SECTIONS["other_councils"].keywords
+
+
+def test_section_registration_and_report_endpoints(tmp_path: Path):
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        assert len(client.get("/api/menu").json()["menu"]) == len(MENU)
+        client.post("/api/admin/login", json={"key": "test-key"})
+
+        bulk = client.post("/api/admin/jobs/bulk", json={"report_date": "2026-08-25"})
+        assert bulk.status_code == 201
+        created = {job["section"] for job in bulk.json()["created"]}
+        assert created == set(SECTIONS)
+
+        # 갈래별 기본 검색 조건이 그대로 적용된다.
+        jobs = {job["section"]: job for job in client.get("/api/admin/jobs").json()["jobs"]}
+        assert jobs["cityhall"]["exclude_keywords"] == ["군산시의회"]
+        assert jobs["other_councils"]["generate_briefing"] is False
+        assert jobs["council"]["generate_briefing"] is True
+
+        # 같은 날짜의 같은 갈래는 다시 등록되지 않는다.
+        again = client.post("/api/admin/jobs/bulk", json={"report_date": "2026-08-25"})
+        assert again.json()["created"] == []
+        assert len(again.json()["skipped"]) == len(SECTIONS)
+
+        overview = client.get("/api/reports/2026-08-25").json()
+        assert set(overview["jobs"]) == set(SECTIONS)
+        assert overview["jobs"]["council"]["status"] == "pending"
+
+        # 승인 전에는 공개 화면에 아무것도 나가지 않는다.
+        assert client.get("/api/reports/2026-08-25/council/articles").status_code == 404
+        assert client.get("/api/reports/2026-08-25/council/briefing").status_code == 404
+        assert client.get("/api/reports/2026-08-25/nope/articles").status_code == 404
+        assert client.get("/api/reports/2026-08-24/council/articles").status_code == 404
+
+
+def test_confirmation_section_is_dropped_from_briefings():
+    body = (
+        "# 한눈에 보기\n조례안 5건이 가결됐다.\n\n"
+        "# 주요 내용\n- 소상공인 지원 조례 원안 가결 [기사 3]\n\n"
+        "# 확인 필요\n본회의 최종 의결 여부 확인 필요. [기사 3]"
+    )
+    cleaned = strip_dropped_sections(body)
+    assert "확인 필요" not in cleaned
+    assert "본회의 최종 의결" not in cleaned
+    assert cleaned.endswith("- 소상공인 지원 조례 원안 가결 [기사 3]")
+
+    # 모델이 다른 표현이나 다른 머리표를 써도 걷어낸다.
+    assert "###" not in strip_dropped_sections("## 주요 내용\n- 항목\n\n### 확인이 필요한 점\n- 무엇")
+    # 뒤에 다른 항목이 이어지면 그 항목은 남는다.
+    kept = strip_dropped_sections("# 확인 필요\n- 무엇\n\n# 주요 내용\n- 항목")
+    assert kept.startswith("# 주요 내용")
+
+
+def test_public_pages_show_nothing_until_the_admin_approves(tmp_path: Path):
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = client.post(
+            "/api/admin/jobs",
+            json={"report_date": "2026-08-25", "section": "council", "generate_briefing": False},
+        ).json()["job"]
+
+        database = Database(make_settings(tmp_path).database_path)
+        for index, publisher in enumerate(("가신문", "나신문", "다신문")):
+            database.upsert_article(
+                sample_article(
+                    job["id"], f"a{index}", f"https://x.example/{index}", publisher,
+                    DISTINCT_BODIES[index],
+                    title=f"군산시의회 소식 {index}",
+                    content_hash=f"hash-{index}",
+                )
+            )
+        client.post(f"/api/admin/jobs/{job['id']}/run")
+
+        # 수집만으로는 공개되지 않는다.
+        overview = client.get("/api/reports/2026-08-25").json()["jobs"]["council"]
+        assert overview["status"] == "complete"
+        assert overview["approved"] is False
+        assert client.get("/api/reports/2026-08-25/council/articles").status_code == 404
+
+        # 관리자 검토 화면에는 모든 기사가 보인다.
+        review = client.get(f"/api/admin/jobs/{job['id']}/articles").json()
+        assert len(review["articles"]) == 3
+        assert review["job"]["needs_review"] is True
+
+        # 한 건을 빼고 승인한다.
+        approved = client.post(
+            f"/api/admin/jobs/{job['id']}/approve", json={"excluded_ids": ["a1"]}
+        ).json()
+        assert (approved["published_count"], approved["excluded_count"]) == (2, 1)
+
+        published = client.get("/api/reports/2026-08-25/council/articles").json()["articles"]
+        assert [article["id"] for article in published] == ["a0", "a2"]
+        assert client.get("/api/reports/2026-08-25").json()["jobs"]["council"]["approved"] is True
+
+        # 공개를 내리면 다시 비공개가 된다.
+        client.post(f"/api/admin/jobs/{job['id']}/unapprove")
+        assert client.get("/api/reports/2026-08-25/council/articles").status_code == 404
+
+        # 다시 수집하면 승인도 함께 풀린다.
+        client.post(f"/api/admin/jobs/{job['id']}/approve", json={"excluded_ids": []})
+        assert client.get("/api/reports/2026-08-25/council/articles").status_code == 200
+        client.post(f"/api/admin/jobs/{job['id']}/run")
+        assert client.get("/api/reports/2026-08-25/council/articles").status_code == 404
+
+
+def test_only_the_council_section_waits_for_review(tmp_path: Path):
+    assert SECTIONS["council"].requires_review is True
+    assert SECTIONS["cityhall"].requires_review is False
+    assert SECTIONS["other_councils"].requires_review is False
+
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        client.post("/api/admin/jobs/bulk", json={"report_date": "2026-08-25"})
+        jobs = {job["section"]: job for job in client.get("/api/admin/jobs").json()["jobs"]}
+        for job in jobs.values():
+            client.post(f"/api/admin/jobs/{job['id']}/run")
+
+        overview = client.get("/api/reports/2026-08-25").json()["jobs"]
+        # 군산시청·타의회는 수집 직후 바로 공개된다.
+        assert overview["cityhall"]["approved"] is True
+        assert overview["other_councils"]["approved"] is True
+        assert client.get("/api/reports/2026-08-25/cityhall/articles").status_code == 200
+        # 군산시의회만 검토를 기다린다.
+        assert overview["council"]["approved"] is False
+        assert client.get("/api/reports/2026-08-25/council/articles").status_code == 404
+
+        listed = {job["section"]: job for job in client.get("/api/admin/jobs").json()["jobs"]}
+        assert listed["council"]["needs_review"] is True
+        assert listed["cityhall"]["needs_review"] is False
+
+
+def test_public_page_points_at_the_latest_collection_only(tmp_path: Path):
+    """공개 화면은 최신 수집 일자 하나만 쓴다. 지난 날짜는 관리자 페이지에서 본다."""
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    make_job(database, report_date="2026-08-25", section="council")
+    make_job(database, report_date="2026-08-27", section="council")
+
+    with TestClient(create_app(settings)) as client:
+        menu = client.get("/api/menu").json()
+        assert menu["latest_date"] == "2026-08-27"
+        assert menu["today"]
+
+        # 지난 날짜도 주소를 직접 치면 열리지만, 화면은 최신분만 가리킨다.
+        assert client.get("/api/dates").json()["dates"] == ["2026-08-27", "2026-08-25"]
+
+
+def test_public_articles_carry_only_link_information(tmp_path: Path):
+    """공개 화면에는 제목·언론사·발행시각·원문 주소만 나간다(직접링크 방식)."""
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = client.post(
+            "/api/admin/jobs",
+            json={"report_date": "2026-08-25", "section": "cityhall", "generate_briefing": False},
+        ).json()["job"]
+
+        database = Database(make_settings(tmp_path).database_path)
+        database.upsert_article(
+            sample_article(
+                job["id"], "a0", "https://www.jjan.kr/article/1", "전북일보", DISTINCT_BODIES[0],
+                title="군산시, 청년 지원 사업 확대", content_hash="hash-0",
+            )
+        )
+        client.post(f"/api/admin/jobs/{job['id']}/run")
+
+        article = client.get("/api/reports/2026-08-25/cityhall/articles").json()["articles"][0]
+        assert set(article) == {
+            "id", "title", "publisher", "published_at", "source_url", "matched_keywords", "preferred",
+        }
+        # 본문과 사진은 공개 응답에 실리지 않는다.
+        assert "content" not in article and "summary" not in article and "images" not in article
+        # 링크는 언론사 기사 주소를 그대로 가리킨다(단순링크가 아닌 직접링크).
+        assert article["source_url"] == "https://www.jjan.kr/article/1"
+        assert article["publisher"] == "전북일보"
+
+        # 관리자 검토 화면에서는 본문을 그대로 볼 수 있다.
+        review = client.get(f"/api/admin/jobs/{job['id']}/articles").json()["articles"][0]
+        assert review["content"].startswith("군산시의회 경제건설위원회")
+
+
+def test_admin_defined_order_drives_the_public_list(tmp_path: Path):
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = client.post(
+            "/api/admin/jobs",
+            json={"report_date": "2026-08-25", "section": "council", "generate_briefing": False},
+        ).json()["job"]
+
+        database = Database(make_settings(tmp_path).database_path)
+        for index in range(3):
+            database.upsert_article(
+                sample_article(
+                    job["id"], f"a{index}", f"https://x.example/{index}", f"{index}신문",
+                    DISTINCT_BODIES[index],
+                    title=f"군산시의회 소식 {index}", content_hash=f"hash-{index}",
+                )
+            )
+        client.post(f"/api/admin/jobs/{job['id']}/run")
+
+        # 관리자가 고른 차례대로 승인한다.
+        approved = client.post(
+            f"/api/admin/jobs/{job['id']}/approve",
+            json={"excluded_ids": [], "ordered_ids": ["a2", "a0", "a1"]},
+        ).json()
+        assert approved["ordered_count"] == 3
+
+        published = client.get("/api/reports/2026-08-25/council/articles").json()["articles"]
+        assert [article["id"] for article in published] == ["a2", "a0", "a1"]
+
+        # 검토 화면도 같은 차례로 다시 열린다.
+        review = client.get(f"/api/admin/jobs/{job['id']}/articles").json()["articles"]
+        assert [article["id"] for article in review] == ["a2", "a0", "a1"]
+        assert [article["sort_order"] for article in review] == [1, 2, 3]
+
+        # 순서를 비워 승인하면 기본 차례(지역 매체 → 최신순)로 돌아간다.
+        client.post(
+            f"/api/admin/jobs/{job['id']}/approve", json={"excluded_ids": [], "ordered_ids": []}
+        )
+        reset = client.get(f"/api/admin/jobs/{job['id']}/articles").json()["articles"]
+        assert {article["sort_order"] for article in reset} == {0}
+
+
+def test_photos_are_not_collected_by_default(monkeypatch):
+    monkeypatch.delenv("IMAGES_ENABLED", raising=False)
+    from app.config import load_settings
+
+    assert load_settings().images_enabled is False
+
+
+def test_excluded_articles_stay_out_of_the_briefing(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database, generate_briefing=True)
+    for index in range(3):
+        database.upsert_article(
+            sample_article(
+                job["id"], f"a{index}", f"https://x.example/{index}", f"{index}신문",
+                DISTINCT_BODIES[index],
+                title=f"군산시의회 소식 {index}",
+                content_hash=f"hash-{index}",
+            )
+        )
+    database.update_job_run(job["id"], status="complete", article_count=3, unique_count=3)
+
+    seen: dict[str, list] = {}
+
+    async def fake_create(job_row, articles):
+        seen["articles"] = articles
+        return {
+            "body": "# 한눈에 보기\n요약", "status": "complete",
+            "model": "test-model", "generated_at": "2026-08-25T05:10:00Z",
+        }
+
+    runner = JobRunner(database, settings)
+    runner.briefing_service.create = fake_create
+    result = asyncio.run(runner.approve(job["id"], ["a1"]))
+
+    assert result["published_count"] == 2
+    assert [article["id"] for article in seen["articles"]] == ["a0", "a2"]
+    assert database.get_job(job["id"])["approved_at"]
+
+
+def test_manual_run_without_rss_completes_empty(tmp_path: Path):
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = client.post(
+            "/api/admin/jobs",
+            json={"report_date": "2026-08-25", "section": "council", "generate_briefing": False},
+        ).json()["job"]
+
+        result = client.post(f"/api/admin/jobs/{job['id']}/run").json()
+        assert result["status"] == "complete"
+        assert (result["article_count"], result["unique_count"]) == (0, 0)
+
+        assert client.get(f"/api/jobs/{job['id']}").json()["job"]["status"] == "complete"
