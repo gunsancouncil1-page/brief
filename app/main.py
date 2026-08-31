@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import shutil
 import sqlite3
@@ -124,6 +125,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         database.initialize()
         database.reset_interrupted_jobs()
+        if settings.host not in {"127.0.0.1", "localhost"} and len(settings.admin_api_key) < 24:
+            # 이 PC 밖에서 열리는데 관리자 키가 짧으면 그대로 위험이 된다.
+            logging.getLogger("uvicorn.error").warning(
+                "관리자 페이지가 %s 에서 열립니다. ADMIN_API_KEY를 더 긴 값으로 바꾸세요.",
+                settings.host,
+            )
         if settings.auto_register:
             # 05:00에 PC가 꺼져 있었더라도, 켜는 시점에 그날 몫을 채우고 이어서 돌린다.
             runner.ensure_registered(datetime.now(settings.timezone).date())
