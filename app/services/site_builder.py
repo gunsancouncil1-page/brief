@@ -8,7 +8,7 @@ from typing import Any
 
 from app.config import PROJECT_ROOT, Settings
 from app.database import Database
-from app.sections import SECTIONS, menu_payload
+from app.sections import menu_payload, section_payload
 
 
 TEMPLATES = PROJECT_ROOT / "app" / "templates"
@@ -90,7 +90,7 @@ def build_site(database: Database, settings: Settings, destination: Path) -> dic
     now = datetime.now(settings.timezone)
     index = {
         "menu": menu_payload(),
-        "sections": {key: section.as_dict() for key, section in SECTIONS.items()},
+        "sections": section_payload(database.section_review_flags()),
         "collect_at": "05:00",
         "today": now.date().isoformat(),
         "latest_date": published_dates[0] if published_dates else None,

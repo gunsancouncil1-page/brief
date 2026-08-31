@@ -180,6 +180,14 @@ class Database:
                     model TEXT NOT NULL,
                     generated_at TEXT NOT NULL
                 );
+
+                -- 관리자가 화면에서 바꾼 메뉴별 공개 방식. 여기 없는 갈래는
+                -- app/sections.py의 기본값을 따른다.
+                CREATE TABLE IF NOT EXISTS section_settings (
+                    section TEXT PRIMARY KEY,
+                    requires_review INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_section_index(conn)
@@ -503,6 +511,27 @@ class Database:
             conn.execute(
                 "UPDATE jobs SET approved_at=?, updated_at=? WHERE id=?",
                 (_now() if approved else None, _now(), job_id),
+            )
+
+    # -- section settings ------------------------------------------------
+
+    def section_review_flags(self) -> dict[str, bool]:
+        """관리자가 바꿔 둔 메뉴별 공개 방식. 손대지 않은 갈래는 담기지 않는다."""
+        with self.connection() as conn:
+            rows = conn.execute("SELECT section, requires_review FROM section_settings").fetchall()
+        return {row["section"]: bool(row["requires_review"]) for row in rows}
+
+    def set_section_review(self, section: str, requires_review: bool) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO section_settings (section, requires_review, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(section) DO UPDATE SET
+                    requires_review=excluded.requires_review,
+                    updated_at=excluded.updated_at
+                """,
+                (section, 1 if requires_review else 0, _now()),
             )
 
     def set_duplicate(self, article_id: str, duplicate_of: str | None) -> None:

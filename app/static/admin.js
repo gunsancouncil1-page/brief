@@ -269,6 +269,73 @@ function renderJobs() {
   );
 }
 
+/* ── 메뉴별 공개 방식 ──────────────────────────────────────── */
+function setSwitchMessage(text, isError = false) {
+  const box = el("switchMessage");
+  box.textContent = text;
+  box.className = isError ? "hint error" : "hint";
+}
+
+function switchRow(section) {
+  const auto = !section.requires_review;
+  const changed = section.requires_review !== section.default_requires_review;
+  return `
+    <div class="switch-row" data-section="${escapeHtml(section.key)}">
+      <span class="switch-text">
+        <span class="switch-name">${escapeHtml(section.label)}</span>
+        <span class="switch-note">
+          ${auto ? "수집한 즉시 공개됩니다." : "스크랩 검토에서 승인해야 공개됩니다."}
+          ${changed ? '<span class="tag tag-manual">기본값과 다름</span>' : ""}
+        </span>
+      </span>
+      <label class="switch">
+        <input type="checkbox" ${auto ? "checked" : ""} aria-label="${escapeHtml(section.label)} 자동 승인" />
+        <span class="switch-track" aria-hidden="true"></span>
+        <span class="switch-label">자동 승인</span>
+      </label>
+    </div>`;
+}
+
+function renderSectionSwitches() {
+  const box = el("sectionSwitches");
+  if (!box) return;
+  box.innerHTML = state.sections.map(switchRow).join("");
+
+  box.querySelectorAll(".switch input").forEach((input) =>
+    input.addEventListener("change", () => {
+      const key = input.closest(".switch-row").dataset.section;
+      setSectionReview(key, !input.checked, input);
+    }),
+  );
+}
+
+async function setSectionReview(key, requiresReview, input) {
+  input.disabled = true;
+  try {
+    const result = await api(`/api/admin/sections/${key}`, {
+      method: "POST",
+      body: JSON.stringify({ requires_review: requiresReview }),
+    });
+    const index = state.sections.findIndex(function (section) { return section.key === key; });
+    if (index >= 0) state.sections[index] = result.section;
+    renderSectionSwitches();
+    renderSections();
+    setSwitchMessage(
+      `${result.section.label} · ` +
+        (requiresReview
+          ? "이제 관리자가 승인해야 공개됩니다."
+          : "이제 수집한 즉시 공개됩니다. 다음 수집부터 적용됩니다."),
+    );
+    await refresh();
+  } catch (error) {
+    // 서버가 받지 않았으면 스위치를 되돌린다.
+    input.checked = !input.checked;
+    setSwitchMessage(error.message, true);
+  } finally {
+    input.disabled = false;
+  }
+}
+
 /* ── Review & approval ─────────────────────────────────────── */
 function setReviewMessage(text, isError = false) {
   const box = el("reviewMessage");
@@ -534,6 +601,7 @@ async function refresh() {
     applySectionDefaults();
   }
   renderSections();
+  renderSectionSwitches();
   renderAll();
 
   const data = await api("/api/admin/jobs");

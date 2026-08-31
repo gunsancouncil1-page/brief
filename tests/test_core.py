@@ -1026,3 +1026,74 @@ def test_bare_date_is_accepted_only_when_it_is_recent():
     stale = """<html><head><title>군산시의회 소식</title></head>
     <body><footer>2011.01.01 창간</footer></body></html>"""
     assert page_metadata(stale, "https://x.example/2", seoul)["published_at"] is None
+
+
+def test_section_review_defaults_match_the_menu_definition(tmp_path: Path):
+    """스위치를 손대기 전에는 갈래 기본값을 그대로 쓴다."""
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        sections = {item["key"]: item for item in client.get("/api/admin/sections").json()["sections"]}
+        assert sections["council"]["requires_review"] is True
+        assert sections["cityhall"]["requires_review"] is False
+        assert sections["broadcast"]["requires_review"] is False
+        assert sections["other_councils"]["requires_review"] is False
+        # 기본값을 함께 알려 줘야 화면에서 "기본값과 다름"을 표시할 수 있다.
+        assert all(
+            item["requires_review"] == item["default_requires_review"] for item in sections.values()
+        )
+
+
+def test_switching_a_menu_to_auto_approval_publishes_without_review(tmp_path: Path):
+    """군산시의회 자동 승인을 켜면 수집한 결과가 검토 없이 공개된다."""
+    settings = make_settings(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = client.post(
+            "/api/admin/jobs",
+            json={"report_date": "2026-08-25", "section": "council", "generate_briefing": False},
+        ).json()["job"]
+
+        # 기본 상태에서는 수집만 하고 승인을 기다린다.
+        assert client.post(f"/api/admin/jobs/{job['id']}/run").json()["approved"] is False
+        assert client.get("/api/reports/2026-08-25/council/articles").status_code == 404
+
+        switched = client.post("/api/admin/sections/council", json={"requires_review": False})
+        assert switched.status_code == 200
+        assert switched.json()["section"]["requires_review"] is False
+        assert switched.json()["section"]["default_requires_review"] is True
+
+        # 다음 수집부터 곧바로 공개된다.
+        database = Database(settings.database_path)
+        database.upsert_article(
+            sample_article(
+                job["id"], "b0", "https://www.jjan.kr/article/7", "전북일보", DISTINCT_BODIES[0],
+                content_hash="hash-switch",
+            )
+        )
+        assert client.post(f"/api/admin/jobs/{job['id']}/run").json()["approved"] is True
+        published = client.get("/api/reports/2026-08-25/council/articles").json()["articles"]
+        assert [article["id"] for article in published] == ["b0"]
+
+        # 다시 끄면 승인을 기다리는 상태로 돌아간다.
+        client.post("/api/admin/sections/council", json={"requires_review": True})
+        assert client.post(f"/api/admin/jobs/{job['id']}/run").json()["approved"] is False
+        assert client.get("/api/reports/2026-08-25/council/articles").status_code == 404
+
+        # 설정은 저장되어 다음 실행에도 남는다.
+        assert Database(settings.database_path).section_review_flags() == {"council": True}
+        assert client.post("/api/admin/sections/nowhere", json={"requires_review": True}).status_code == 404
+
+
+def test_public_menu_reports_the_current_publishing_mode(tmp_path: Path):
+    """공개 화면과 정적 사이트도 지금 적용 중인 공개 방식을 그대로 싣는다."""
+    settings = make_settings(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        client.post("/api/admin/sections/council", json={"requires_review": False})
+        menu = client.get("/api/menu").json()
+        assert menu["sections"]["council"]["requires_review"] is False
+
+    site = tmp_path / "site"
+    build_site(Database(settings.database_path), settings, site)
+    index = json.loads((site / "data" / "index.json").read_text(encoding="utf-8"))
+    assert index["sections"]["council"]["requires_review"] is False

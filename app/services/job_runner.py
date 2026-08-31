@@ -9,7 +9,7 @@ import httpx
 
 from app.config import Settings
 from app.database import Database
-from app.sections import SECTIONS
+from app.sections import SECTIONS, review_required
 from app.services.briefing import BriefingService
 from app.services.crawler import (
     DuplicateDetector,
@@ -19,10 +19,9 @@ from app.services.crawler import (
 )
 
 
-def requires_review(job: dict[str, Any]) -> bool:
-    """검토가 필요한 갈래인지. 정의에 없는 갈래는 안전하게 검토 대상으로 본다."""
-    section = SECTIONS.get(job["section"])
-    return section.requires_review if section else True
+def requires_review(job: dict[str, Any], overrides: dict[str, bool] | None = None) -> bool:
+    """검토가 필요한 갈래인지. 관리자가 화면에서 바꿔 둔 값이 있으면 그것을 따른다."""
+    return review_required(job["section"], overrides)
 
 
 SATURDAY, SUNDAY = 5, 6
@@ -59,6 +58,10 @@ class JobRunner:
     @property
     def busy(self) -> bool:
         return self._lock.locked()
+
+    def review_required(self, job: dict[str, Any]) -> bool:
+        """관리자가 정한 지금의 공개 방식으로 판단한다."""
+        return requires_review(job, self.database.section_review_flags())
 
     def job_dir(self, job: dict[str, Any]) -> Path:
         return self.settings.media_dir / job["report_date"] / job["id"]
@@ -208,7 +211,7 @@ class JobRunner:
             "article_count": total_count,
             "unique_count": unique_count,
         }
-        if not requires_review(job):
+        if not self.review_required(job):
             # 관리자가 예전에 빼 둔 기사가 있으면 그대로 유지한 채 다시 공개한다.
             kept_out = [
                 article["id"] for article in self.database.articles(job_id) if article["excluded"]

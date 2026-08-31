@@ -183,6 +183,29 @@ MENU: tuple[MenuTab, ...] = (
 )
 
 
+def review_required(section_key: str, overrides: dict[str, bool] | None = None) -> bool:
+    """이 갈래가 관리자 승인을 기다려야 하는지.
+
+    관리자가 화면에서 바꿔 둔 값이 있으면 그것을, 없으면 갈래의 기본값을 쓴다.
+    정의에 없는 갈래는 안전하게 검토 대상으로 본다.
+    """
+    if overrides and section_key in overrides:
+        return overrides[section_key]
+    section = SECTIONS.get(section_key)
+    return section.requires_review if section else True
+
+
+def section_payload(overrides: dict[str, bool] | None = None) -> dict[str, dict[str, Any]]:
+    """화면에 넘길 갈래 정의. 공개 방식은 지금 적용 중인 값으로 채운다."""
+    payload = {}
+    for key, section in SECTIONS.items():
+        item = section.as_dict()
+        item["requires_review"] = review_required(key, overrides)
+        item["default_requires_review"] = section.requires_review
+        payload[key] = item
+    return payload
+
+
 def menu_payload() -> list[dict[str, str]]:
     return [
         {

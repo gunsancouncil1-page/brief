@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.config import PROJECT_ROOT, Settings, load_settings
 from app.database import Database
 from app.security import SESSION_COOKIE, issue_session, verify_session
-from app.sections import MENU, SECTIONS, menu_payload
+from app.sections import MENU, SECTIONS, menu_payload, section_payload
 from app.services.crawler import MATCH_MODES, SearchSpec
 from app.services.job_runner import (
     JobRunner,
@@ -115,6 +115,11 @@ class ApprovalRequest(BaseModel):
 class LinkedArticleRequest(BaseModel):
     # 관리자가 검토 화면에서 붙여 넣는 기사 주소.
     url: str
+
+
+class SectionReviewRequest(BaseModel):
+    # True면 관리자 승인 후 공개, False면 수집 즉시 공개.
+    requires_review: bool
 
 
 class LoginRequest(BaseModel):
@@ -260,7 +265,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         dates = database.dates()
         return {
             "menu": menu_payload(),
-            "sections": {key: section.as_dict() for key, section in SECTIONS.items()},
+            "sections": section_payload(database.section_review_flags()),
             "collect_at": f"{COLLECT_HOUR:02d}:{COLLECT_MINUTE:02d}",
             "today": datetime.now(settings.timezone).date().isoformat(),
             "latest_date": dates[0] if dates else None,
@@ -371,7 +376,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "authenticated": verify_session(settings.admin_api_key, session),
             "configured": bool(settings.admin_api_key),
-            "sections": [SECTIONS[tab.section].as_dict() for tab in MENU if tab.view == "articles"],
+            "sections": _section_list(),
             "collect_at": f"{COLLECT_HOUR:02d}:{COLLECT_MINUTE:02d}",
             "timezone": str(settings.timezone),
             "scheduler": bool(app.state.scheduler),
@@ -381,6 +386,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "busy": runner.busy,
         }
 
+    def _section_list() -> list[dict[str, Any]]:
+        """관리자 화면에 쓰는 갈래 목록. 메뉴 차례를 그대로 따른다."""
+        payload = section_payload(database.section_review_flags())
+        return [payload[tab.section] for tab in MENU if tab.view == "articles"]
+
     def _decorate(job: dict[str, Any]) -> dict[str, Any]:
         job["runnable_now"] = (
             job["status"] in {"pending", "failed", "complete"}
@@ -389,7 +399,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job["query_preview"] = SearchSpec.from_job(job).query
         job["section_label"] = SECTIONS[job["section"]].label if job["section"] in SECTIONS else job["name"]
         job["approved"] = bool(job["approved_at"])
-        job["requires_review"] = requires_review(job)
+        job["requires_review"] = requires_review(job, database.section_review_flags())
         job["needs_review"] = (
             job["requires_review"] and job["status"] == "complete" and not job["approved_at"]
         )
@@ -527,6 +537,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def unapprove_job(job_id: str, _: bool = Depends(require_admin)):
         _job_or_404(job_id)
         return runner.unapprove(job_id)
+
+    @app.get("/api/admin/sections")
+    async def admin_sections(_: bool = Depends(require_admin)):
+        return {"sections": _section_list()}
+
+    @app.post("/api/admin/sections/{section}")
+    async def set_section_review(
+        section: str, payload: SectionReviewRequest, _: bool = Depends(require_admin)
+    ):
+        """메뉴 하나의 공개 방식을 바꾼다. 다음 수집부터 이 값을 따른다."""
+        if section not in SECTIONS:
+            raise HTTPException(status_code=404, detail="없는 메뉴입니다.")
+        database.set_section_review(section, payload.requires_review)
+        payload_sections = section_payload(database.section_review_flags())
+        return {"section": payload_sections[section]}
 
     @app.post("/api/admin/publish")
     async def publish_site(_: bool = Depends(require_admin)):
