@@ -112,6 +112,11 @@ class ApprovalRequest(BaseModel):
     ordered_ids: list[str] = Field(default_factory=list)
 
 
+class LinkedArticleRequest(BaseModel):
+    # 관리자가 검토 화면에서 붙여 넣는 기사 주소.
+    url: str
+
+
 class LoginRequest(BaseModel):
     key: str
 
@@ -494,6 +499,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """검토 화면용. 중복으로 묶인 기사와 제외 표시까지 그대로 넘긴다."""
         job = _job_or_404(job_id)
         return {"job": _decorate(job), "articles": database.articles(job_id)}
+
+    @app.post("/api/admin/jobs/{job_id}/articles", status_code=201)
+    async def add_linked_article(
+        job_id: str, payload: LinkedArticleRequest, _: bool = Depends(require_admin)
+    ):
+        """검토 화면에서 붙여 넣은 기사 주소를 스크랩에 더한다."""
+        _job_or_404(job_id)
+        try:
+            return await runner.add_linked_article(job_id, payload.url)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post("/api/admin/jobs/{job_id}/approve")
     async def approve_job(

@@ -251,6 +251,206 @@ def extract_article_text(html: str) -> str:
     return main.get_text("\n", strip=True)
 
 
+DATE_META_KEYS = (
+    "article:published_time",
+    "og:article:published_time",
+    "article:modified_time",
+    "datePublished",
+    "date",
+    "pubdate",
+    "sailthru.date",
+)
+
+
+def _meta_value(soup: BeautifulSoup, key: str) -> str:
+    pattern = re.compile(f"^{re.escape(key)}$", re.IGNORECASE)
+    for attribute in ("property", "name", "itemprop"):
+        tag = soup.find("meta", attrs={attribute: pattern})
+        if tag and tag.get("content"):
+            return str(tag["content"]).strip()
+    return ""
+
+
+KOREAN_DATE = re.compile(
+    r"(\d{4})[.\-/년]\s*(\d{1,2})[.\-/월]\s*(\d{1,2})일?"
+    r"(?:\D{0,4}(\d{1,2}):(\d{2}))?"
+)
+
+
+def parse_datetime_text(raw: str, timezone) -> datetime | None:
+    """기사 페이지에 적힌 발행 시각 문자열을 시각으로 바꾼다."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    candidates = [raw.replace("Z", "+00:00")]
+    # 국내 언론사는 "2026.08.31 14:20"처럼 점을 찍어 적는 곳이 많다.
+    korean = KOREAN_DATE.search(raw)
+    if korean:
+        year, month, day, hour, minute = korean.groups()
+        candidates.append(
+            f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+            f"T{int(hour or 0):02d}:{int(minute or 0):02d}:00"
+        )
+
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone)
+        return parsed.astimezone(timezone)
+
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone)
+    return parsed.astimezone(timezone)
+
+
+TITLE_TAIL = re.compile(r"\s*[|·>]\s*|\s+-\s+(?=[^-]{2,20}$)")
+# 제목 끝에 붙은 매체 이름. "기사 제목 - 군산신문"의 뒷부분을 집는다.
+TITLE_PUBLISHER = re.compile(r"[|·>\-–]\s*([^|·>\-–]{2,20}?)\s*$")
+# 본문 위쪽의 "입력 2026.08.29 17:59" 같은 표기.
+LABELED_DATE = re.compile(
+    r"(?:입력|등록|송고|작성|승인|발행|기사입력)\s*[:]?\s*"
+    r"(\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?(?:\D{0,4}\d{1,2}:\d{2})?)"
+)
+PLAIN_DATE_TIME = re.compile(r"\d{4}[.\-/년]\s*\d{1,2}[.\-/월]\s*\d{1,2}일?\D{0,4}\d{1,2}:\d{2}")
+
+
+def _title_publisher(raw_title: str) -> str:
+    match = TITLE_PUBLISHER.search(clean_html(raw_title))
+    if not match:
+        return ""
+    tail = match.group(1).strip()
+    # 제목 조각이 아니라 매체 이름인지 대충 가늠한다. 띄어쓰기가 거의 없다.
+    return tail if tail and tail.count(" ") <= 1 else ""
+
+
+def _recent_date_in_text(text: str, timezone) -> datetime | None:
+    """시각 표기가 아예 없을 때, 지면 위쪽에 적힌 날짜를 마지막으로 찾아본다.
+
+    저작권 표기 연도나 다른 기사 목록의 날짜를 잘못 집지 않도록,
+    최근 두 달 안쪽의 날짜만 받아들인다.
+    """
+    now = datetime.now(UTC).astimezone(timezone)
+    for match in KOREAN_DATE.finditer(text):
+        parsed = parse_datetime_text(match.group(0), timezone)
+        if parsed and timedelta(0) <= now - parsed <= timedelta(days=60):
+            return parsed
+    return None
+
+
+def page_metadata(html: str, url: str, timezone) -> dict[str, Any]:
+    """원문 페이지에서 제목, 매체, 발행 시각을 읽어 낸다."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    document_title = clean_html(soup.title.string) if soup.title and soup.title.string else ""
+
+    title = _meta_value(soup, "og:title") or _meta_value(soup, "twitter:title") or document_title
+    if not title:
+        heading = soup.find(["h1", "h2"])
+        title = heading.get_text(" ", strip=True) if heading else ""
+    title = clean_html(title)
+    # 제목 뒤에 "- 매체명"이 따라붙는다. 제목이 너무 짧아지지 않을 때만 떼어 낸다.
+    if len(title) > 20:
+        title = TITLE_TAIL.split(title)[0].strip() or title
+    title = title.strip(" -–|·>")
+
+    published_at = None
+    for key in DATE_META_KEYS:
+        published_at = parse_datetime_text(_meta_value(soup, key), timezone)
+        if published_at:
+            break
+    if not published_at:
+        time_tag = soup.find("time")
+        if time_tag:
+            raw = time_tag.get("datetime") or time_tag.get_text(" ", strip=True)
+            published_at = parse_datetime_text(str(raw), timezone)
+    if not published_at:
+        # 시각을 메타 태그에 적지 않는 지역 매체가 많다. 지면에 찍힌 표기를 읽는다.
+        text = soup.get_text(" ", strip=True)[:6000]
+        labeled = LABELED_DATE.search(text) or PLAIN_DATE_TIME.search(text)
+        if labeled:
+            found = labeled.group(1) if labeled.re is LABELED_DATE else labeled.group(0)
+            published_at = parse_datetime_text(found, timezone)
+        if not published_at:
+            published_at = _recent_date_in_text(text[:2000], timezone)
+
+    publisher = (
+        publisher_for(url)
+        or clean_html(_meta_value(soup, "og:site_name"))
+        or clean_html(_meta_value(soup, "publisher"))
+        or _title_publisher(document_title)
+        or re.sub(r"^www\.", "", urlparse(url).netloc)
+    )
+    return {
+        "title": title,
+        "publisher": publisher,
+        "published_at": published_at,
+    }
+
+
+async def fetch_linked_article(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    job_id: str,
+    report_date: str,
+    timezone,
+) -> dict[str, Any]:
+    """관리자가 붙여 넣은 주소 하나를 기사 한 건으로 만든다.
+
+    검색으로 찾은 기사와 달리 키워드 조건과 매체 제한을 따지지 않는다.
+    관리자가 직접 고른 기사이므로 그 판단을 그대로 따른다.
+    """
+    response = await client.get(url)
+    response.raise_for_status()
+    resolved_url = str(response.url)
+    html = response.text
+
+    if is_google_news(resolved_url):
+        publisher_url = await resolve_google_news_url(client, html)
+        if not publisher_url:
+            raise ValueError("구글 뉴스 주소에서 원문을 찾지 못했습니다. 원문 주소를 붙여 넣어 주세요.")
+        response = await client.get(publisher_url)
+        response.raise_for_status()
+        resolved_url = str(response.url)
+        html = response.text
+
+    metadata = page_metadata(html, resolved_url, timezone)
+    if not metadata["title"]:
+        raise ValueError("기사 제목을 찾지 못했습니다. 기사 본문 주소가 맞는지 확인해 주세요.")
+
+    content = await asyncio.to_thread(extract_article_text, html)
+    content = re.sub(r"\n{3,}", "\n\n", strip_ad_lines(content)).strip()
+    published_at = metadata["published_at"] or datetime.now(UTC).astimezone(timezone)
+
+    article_id = hashlib.sha256(f"{job_id}|{resolved_url}".encode("utf-8")).hexdigest()[:32]
+    signature = normalize_text(f"{metadata['title']} {content[:1200]}")
+    return {
+        "id": article_id,
+        "job_id": job_id,
+        "report_date": report_date,
+        "title": metadata["title"],
+        "publisher": metadata["publisher"],
+        "source_url": resolved_url,
+        "published_at": published_at.isoformat(),
+        "scraped_at": datetime.now(UTC).isoformat(),
+        "summary": content[:280],
+        "content": content or metadata["title"],
+        "content_hash": hashlib.sha256(signature.encode("utf-8")).hexdigest(),
+        "matched_keywords": [],
+        "preferred": 0,
+        "manual": 1,
+        "duplicate_of": None,
+        "images": [],
+    }
+
+
 class GoogleNewsRssCollector:
     """RSS로 후보를 찾고, 원문 페이지에서 본문을 추출한다.
 
@@ -417,6 +617,7 @@ class DuplicateDetector:
         ranked = sorted(
             articles,
             key=lambda article: (
+                bool(article.get("manual")),
                 bool(article.get("preferred")),
                 len(article.get("images") or []),
                 len(article["content"]),
@@ -425,13 +626,18 @@ class DuplicateDetector:
         )
         canonical_articles: list[dict[str, Any]] = []
         for article in ranked:
-            duplicate_of = next(
-                (
-                    canonical["id"]
-                    for canonical in canonical_articles
-                    if self._is_duplicate(article, canonical)
-                ),
-                None,
+            # 관리자가 손수 넣은 기사는 묶어 숨기지 않는다.
+            duplicate_of = (
+                None
+                if article.get("manual")
+                else next(
+                    (
+                        canonical["id"]
+                        for canonical in canonical_articles
+                        if self._is_duplicate(article, canonical)
+                    ),
+                    None,
+                )
             )
             database.set_duplicate(article["id"], duplicate_of)
             if duplicate_of is None:

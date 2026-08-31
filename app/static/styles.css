@@ -428,6 +428,7 @@ a { color: inherit; }
 
 .tag-duplicate { color: var(--warn); background: var(--warn-wash); }
 .tag-keyword   { color: var(--accent-ink); background: var(--accent-wash); }
+.tag-manual    { color: var(--ok); background: var(--ok-wash); }
 
 .text-link {
   display: inline-block;
@@ -511,6 +512,16 @@ a { color: inherit; }
 .field:focus { border-color: var(--accent); outline: none; }
 
 .inline-fields { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* 검토 화면에서 기사 주소를 직접 넣는 자리. */
+.link-add {
+  margin: 14px 0 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--paper-2);
+}
+.link-add .inline-fields .field { max-width: 420px; flex: 1 1 240px; }
 .inline-fields .field { max-width: 280px; }
 
 .hint { color: var(--muted); font-size: .75rem; line-height: 1.6; }

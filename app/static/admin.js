@@ -290,6 +290,7 @@ function reviewRow(article, index, total) {
         <span class="review-meta">
           ${escapeHtml(article.publisher)} · ${escapeHtml(formatDateTime(article.published_at))}
           ${article.duplicate_of ? '<span class="tag tag-duplicate">중복</span>' : ""}
+          ${article.manual ? '<span class="tag tag-manual">직접 추가</span>' : ""}
         </span>
         <span class="review-excerpt">${escapeHtml(body)}</span>
         <a class="text-link" href="${escapeHtml(article.source_url)}" target="_blank" rel="noopener noreferrer">원문 열기</a>
@@ -384,6 +385,8 @@ async function openReview(jobId) {
         .map((article) => article.id),
     );
     setReviewMessage("");
+    el("linkInput").value = "";
+    setLinkMessage("검색에서 빠진 기사는 주소를 붙여 넣어 직접 넣을 수 있습니다.");
     renderReview();
     el("reviewCard").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
@@ -426,6 +429,55 @@ async function unapprove(jobId) {
     setMessage(error.message, true);
   }
 }
+
+function setLinkMessage(text, isError = false) {
+  const box = el("linkMessage");
+  box.textContent = text;
+  box.className = isError ? "hint error" : "hint";
+}
+
+async function addLinkedArticle() {
+  if (!state.review) return;
+  const input = el("linkInput");
+  const url = input.value.trim();
+  if (!url) {
+    setLinkMessage("기사 주소를 넣어 주세요.", true);
+    return;
+  }
+  const button = el("addLink");
+  button.disabled = true;
+  setLinkMessage("기사를 읽어 오는 중입니다…");
+  try {
+    const result = await api(`/api/admin/jobs/${state.review.id}/articles`, {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
+    const article = result.article;
+    const existing = state.reviewArticles.findIndex(function (item) { return item.id === article.id; });
+    if (existing >= 0) state.reviewArticles[existing] = article;
+    else state.reviewArticles.push(article);
+    // 직접 넣은 기사는 공개가 기본이다.
+    state.excluded.delete(article.id);
+    input.value = "";
+    renderReview();
+    setLinkMessage(
+      (result.already_present ? "이미 있던 기사를 새로 읽었습니다" : "기사를 추가했습니다") +
+        ` · ${article.publisher} · ${formatDateTime(article.published_at)}` +
+        (result.approved ? " · 승인하고 공개를 다시 누르면 브리핑에도 반영됩니다." : ""),
+    );
+  } catch (error) {
+    setLinkMessage(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+el("addLink").addEventListener("click", addLinkedArticle);
+el("linkInput").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  addLinkedArticle();
+});
 
 el("approveButton").addEventListener("click", approveReview);
 el("closeReview").addEventListener("click", () => {

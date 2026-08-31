@@ -65,6 +65,7 @@ class Database:
             ("jobs", "preferred_sites"): "TEXT NOT NULL DEFAULT '[]'",
             ("articles", "preferred"): "INTEGER NOT NULL DEFAULT 0",
             ("articles", "sort_order"): "INTEGER NOT NULL DEFAULT 0",
+            ("articles", "manual"): "INTEGER NOT NULL DEFAULT 0",
         }
         for (table, column), definition in additions.items():
             exists = conn.execute(
@@ -147,6 +148,7 @@ class Database:
                     preferred INTEGER NOT NULL DEFAULT 0,
                     excluded INTEGER NOT NULL DEFAULT 0,
                     sort_order INTEGER NOT NULL DEFAULT 0,
+                    manual INTEGER NOT NULL DEFAULT 0,
                     duplicate_of TEXT REFERENCES articles(id),
                     UNIQUE(job_id, source_url)
                 );
@@ -350,9 +352,11 @@ class Database:
         fields = (
             "id", "job_id", "report_date", "title", "publisher", "source_url",
             "published_at", "scraped_at", "summary", "content", "content_hash",
-            "matched_keywords", "preferred", "duplicate_of",
+            "matched_keywords", "preferred", "manual", "duplicate_of",
         )
-        payload = dict(article)
+        # 선택 항목은 빠져 있어도 기본값으로 채운다.
+        payload = {"matched_keywords": [], "preferred": 0, "manual": 0, "duplicate_of": None}
+        payload.update(article)
         matched = payload.get("matched_keywords", [])
         if not isinstance(matched, str):
             payload["matched_keywords"] = json.dumps(matched, ensure_ascii=False)
@@ -372,7 +376,8 @@ class Database:
                     content=excluded.content,
                     content_hash=excluded.content_hash,
                     matched_keywords=excluded.matched_keywords,
-                    preferred=excluded.preferred
+                    preferred=excluded.preferred,
+                    manual=MAX(articles.manual, excluded.manual)
                 """,
                 values,
             )
@@ -392,7 +397,7 @@ class Database:
                 f"""
                 SELECT id, job_id, report_date, title, publisher, source_url, published_at,
                        scraped_at, summary, content, content_hash, matched_keywords,
-                       preferred, excluded, sort_order, duplicate_of
+                       preferred, excluded, sort_order, manual, duplicate_of
                 FROM articles
                 WHERE job_id=? {clause}
                 -- 관리자가 정한 순서가 먼저다. 정하지 않았으면(0) 지역 매체가 위로 온다.
@@ -412,6 +417,7 @@ class Database:
             article = dict(row)
             article["matched_keywords"] = json.loads(article["matched_keywords"] or "[]")
             article["preferred"] = bool(article["preferred"])
+            article["manual"] = bool(article["manual"])
             article["excluded"] = bool(article["excluded"])
             article["images"] = images.get(article["id"], [])
             articles.append(article)

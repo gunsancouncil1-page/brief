@@ -5,11 +5,18 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from app.config import Settings
 from app.database import Database
 from app.sections import SECTIONS
 from app.services.briefing import BriefingService
-from app.services.crawler import DuplicateDetector, GoogleNewsRssCollector, SearchSpec
+from app.services.crawler import (
+    DuplicateDetector,
+    GoogleNewsRssCollector,
+    SearchSpec,
+    fetch_linked_article,
+)
 
 
 def requires_review(job: dict[str, Any]) -> bool:
@@ -216,6 +223,68 @@ class JobRunner:
             result["published_count"] = approval["published_count"]
             result["briefing_status"] = approval["briefing_status"]
         return result
+
+    async def add_linked_article(self, job_id: str, url: str) -> dict[str, Any]:
+        """관리자가 붙여 넣은 기사 주소를 그 날짜의 스크랩에 더한다.
+
+        검색이 놓친 기사를 관리자가 직접 채워 넣는 통로다. 키워드 조건과 매체
+        제한은 적용하지 않고, 중복으로 묶여 사라지지도 않는다.
+        """
+        job = self.database.get_job(job_id)
+        if job is None:
+            raise LookupError("Unknown job")
+        if job["status"] == "running":
+            raise RuntimeError("수집이 도는 중에는 기사를 추가할 수 없습니다.")
+
+        url = (url or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("http로 시작하는 기사 주소를 넣어 주세요.")
+
+        headers = {"User-Agent": self.settings.user_agent}
+        timeout = httpx.Timeout(self.settings.request_timeout_seconds)
+        async with httpx.AsyncClient(
+            headers=headers, timeout=timeout, follow_redirects=True
+        ) as client:
+            try:
+                article = await fetch_linked_article(
+                    client,
+                    url,
+                    job_id=job_id,
+                    report_date=job["report_date"],
+                    timezone=self.settings.timezone,
+                )
+            except httpx.HTTPError as error:
+                raise ValueError(f"기사 주소를 여는 데 실패했습니다: {error}") from error
+
+        existing = {item["source_url"]: item for item in self.database.articles(job_id)}
+        already = existing.get(article["source_url"]) is not None
+
+        article.pop("images", None)
+        self.database.upsert_article(article)
+        total_count, unique_count = self.duplicate_detector.mark(self.database, job_id)
+        self.database.update_job_run(
+            job_id,
+            status=job["status"],
+            article_count=total_count,
+            unique_count=unique_count,
+            error_message=job["error_message"],
+            last_run_at=job["last_run_at"],
+        )
+
+        saved = next(
+            (item for item in self.database.articles(job_id) if item["id"] == article["id"]),
+            None,
+        )
+        return {
+            "job_id": job_id,
+            "article": saved,
+            "already_present": already,
+            "article_count": total_count,
+            "unique_count": unique_count,
+            # 이미 공개된 갈래라면 기사는 바로 보이지만 브리핑은 예전 것 그대로다.
+            "approved": bool(job["approved_at"]),
+        }
+
 
     async def approve(
         self,

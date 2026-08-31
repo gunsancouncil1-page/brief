@@ -1,10 +1,11 @@
 import asyncio
 import json
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -19,6 +20,7 @@ from app.services.crawler import (
     _google_article_tokens,
     is_google_news,
     match_keywords,
+    page_metadata,
 )
 from app.services.images import _normalize, body_image_urls
 from app.services.job_runner import JobRunner, is_collection_day, report_window
@@ -888,3 +890,139 @@ def test_manual_run_without_rss_completes_empty(tmp_path: Path):
         assert (result["article_count"], result["unique_count"]) == (0, 0)
 
         assert client.get(f"/api/jobs/{job['id']}").json()["job"]["status"] == "complete"
+
+
+LINKED_HTML = """
+<html><head>
+  <title>군산시의회, 예산 심사 마무리 - 군산신문</title>
+  <meta property="og:title" content="군산시의회, 2026년도 예산 심사 마무리" />
+  <meta property="article:published_time" content="2026-08-24T15:30:00+09:00" />
+  <meta property="og:site_name" content="군산신문" />
+</head><body><article>
+  <p>군산시의회는 24일 제260회 임시회를 열고 2026년도 추가경정예산안 심사를 마무리했다.</p>
+  <p>예산결산특별위원회는 사업의 시급성과 집행 가능성을 따져 일부 항목을 조정했다고 밝혔다.</p>
+  <p>의회는 남은 회기 동안 조례안 심사를 이어 갈 예정이다.</p>
+</article></body></html>
+"""
+
+
+def test_page_metadata_reads_title_publisher_and_time():
+    seoul = ZoneInfo("Asia/Seoul")
+    meta = page_metadata(LINKED_HTML, "https://www.gunsannews.com/news/1", seoul)
+    assert meta["title"] == "군산시의회, 2026년도 예산 심사 마무리"
+    assert meta["publisher"] == "군산신문"
+    assert meta["published_at"].isoformat() == "2026-08-24T15:30:00+09:00"
+
+    # 메타 태그가 없으면 <title>에서 매체 이름을 떼고, <time>에서 시각을 읽는다.
+    bare = """<html><head><title>군산시의회 임시회 개회와 주요 안건 처리 - 어떤신문</title></head>
+    <body><time datetime="2026.08.24 09:15">2026.08.24</time></body></html>"""
+    fallback = page_metadata(bare, "https://unknown.example/news/9", seoul)
+    assert fallback["title"] == "군산시의회 임시회 개회와 주요 안건 처리"
+    # 제목 끝에 붙은 매체 이름을 매체로 쓴다.
+    assert fallback["publisher"] == "어떤신문"
+    assert fallback["published_at"].isoformat() == "2026-08-24T09:15:00+09:00"
+
+    # 매체 이름을 어디에도 적지 않으면 www를 뗀 주소를 쓰고,
+    # 시각은 지면에 찍힌 "입력 …" 표기에서 읽는다.
+    plain = """<html><head><title>군산시의회 소식</title></head>
+    <body><h1>군산시의회, 조례안 3건 의결</h1>
+    <span>입력 2026.08.24 16:05</span></body></html>"""
+    guessed = page_metadata(plain, "https://www.nowhere.example/read/3", seoul)
+    assert guessed["publisher"] == "nowhere.example"
+    assert guessed["published_at"].isoformat() == "2026-08-24T16:05:00+09:00"
+
+
+def _linked_article_client(monkeypatch, html: str = LINKED_HTML):
+    """관리자가 붙여 넣은 주소를 열면 위 기사 페이지가 나오도록 만든다."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html=html)
+
+    original = httpx.AsyncClient
+
+    def factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original(**kwargs)
+
+    monkeypatch.setattr("app.services.job_runner.httpx.AsyncClient", factory)
+
+
+def test_admin_can_add_an_article_by_pasting_its_link(tmp_path: Path, monkeypatch):
+    """검토 화면에서 붙여 넣은 주소가 그대로 스크랩에 더해진다."""
+    _linked_article_client(monkeypatch)
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = client.post(
+            "/api/admin/jobs",
+            json={"report_date": "2026-08-25", "section": "council", "generate_briefing": False},
+        ).json()["job"]
+        client.post(f"/api/admin/jobs/{job['id']}/run")
+
+        response = client.post(
+            f"/api/admin/jobs/{job['id']}/articles",
+            json={"url": "https://www.gunsannews.com/news/articleView.html?idxno=1"},
+        )
+        assert response.status_code == 201
+        added = response.json()["article"]
+        assert added["title"] == "군산시의회, 2026년도 예산 심사 마무리"
+        assert added["publisher"] == "군산신문"
+        assert added["published_at"] == "2026-08-24T15:30:00+09:00"
+        assert added["manual"] is True and added["duplicate_of"] is None
+        assert response.json()["already_present"] is False
+
+        # 검토 목록에 바로 보이고, 승인하면 공개 화면에 오른다.
+        review = client.get(f"/api/admin/jobs/{job['id']}/articles").json()["articles"]
+        assert [item["id"] for item in review] == [added["id"]]
+        client.post(f"/api/admin/jobs/{job['id']}/approve", json={"excluded_ids": []})
+        public = client.get("/api/reports/2026-08-25/council/articles").json()["articles"]
+        assert public[0]["source_url"] == "https://www.gunsannews.com/news/articleView.html?idxno=1"
+        assert public[0]["title"] == "군산시의회, 2026년도 예산 심사 마무리"
+
+        # 같은 주소를 다시 넣어도 기사는 하나로 유지된다.
+        again = client.post(
+            f"/api/admin/jobs/{job['id']}/articles",
+            json={"url": "https://www.gunsannews.com/news/articleView.html?idxno=1"},
+        ).json()
+        assert again["already_present"] is True
+        assert len(client.get(f"/api/admin/jobs/{job['id']}/articles").json()["articles"]) == 1
+
+        # 기사 주소가 아니면 이유를 알려 주고 아무것도 넣지 않는다.
+        bad = client.post(f"/api/admin/jobs/{job['id']}/articles", json={"url": "gunsan.go.kr"})
+        assert bad.status_code == 400 and "http" in bad.json()["detail"]
+
+
+def test_manually_added_article_survives_duplicate_grouping(tmp_path: Path):
+    """관리자가 직접 넣은 기사는 같은 내용이 있어도 묶여 사라지지 않는다."""
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database)
+
+    database.upsert_article(
+        sample_article(job["id"], "auto", "https://a.example/1", "어떤신문", DISTINCT_BODIES[0])
+    )
+    manual = sample_article(job["id"], "manual", "https://b.example/1", "군산신문", DISTINCT_BODIES[0])
+    manual["manual"] = 1
+    database.upsert_article(manual)
+
+    total, unique = DuplicateDetector().mark(database, job["id"])
+    assert (total, unique) == (2, 1)
+    kept = [article for article in database.articles(job["id"]) if not article["duplicate_of"]]
+    assert [article["id"] for article in kept] == ["manual"]
+    assert kept[0]["manual"] is True
+
+
+def test_bare_date_is_accepted_only_when_it_is_recent():
+    """시각 표기가 없는 지면은 최근 날짜만 발행일로 인정한다."""
+    seoul = ZoneInfo("Asia/Seoul")
+    recent = (datetime.now(UTC).astimezone(seoul) - timedelta(days=2)).strftime("%Y.%m.%d")
+    html = f"""<html><head><title>군산시의회 소식</title></head>
+    <body><h1>군산시의회, 조례안 의결</h1><span>{recent}</span>
+    <footer>2011.01.01 창간</footer></body></html>"""
+    meta = page_metadata(html, "https://x.example/1", seoul)
+    assert meta["published_at"].strftime("%Y.%m.%d") == recent
+
+    # 오래된 날짜밖에 없으면 발행일을 지어내지 않는다(호출한 쪽이 현재 시각을 쓴다).
+    stale = """<html><head><title>군산시의회 소식</title></head>
+    <body><footer>2011.01.01 창간</footer></body></html>"""
+    assert page_metadata(stale, "https://x.example/2", seoul)["published_at"] is None
