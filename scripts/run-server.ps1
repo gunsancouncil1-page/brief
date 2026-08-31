@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$AppHost,
     [int]$Port
 )
@@ -24,9 +24,35 @@ if (Test-Path -LiteralPath $envFile) {
 if ($AppHost) { $resolvedHost = $AppHost }
 if ($Port) { $resolvedPort = $Port }
 
-if ($resolvedHost -ne '127.0.0.1' -and $resolvedHost -ne 'localhost') {
+# 실행이 왜 안 되는지 먼저 짚어 준다. 그냥 죽어 버리면 원인을 알기 어렵다.
+$inUse = Get-NetTCPConnection -LocalPort $resolvedPort -State Listen -ErrorAction SilentlyContinue
+if ($inUse) {
+    $owner = Get-Process -Id $inUse[0].OwningProcess -ErrorAction SilentlyContinue
+    Write-Host "$resolvedPort 번 포트를 이미 다른 프로그램이 쓰고 있습니다." -ForegroundColor Red
+    Write-Host "  PID $($inUse[0].OwningProcess) $(if ($owner) { $owner.ProcessName })" -ForegroundColor Red
+    Write-Host '  그 프로그램을 끄거나, 다른 포트로 실행하세요:  .\scripts\run-server.ps1 -Port 8001' -ForegroundColor Red
+    exit 1
+}
+
+$anyAddress = @('0.0.0.0', '127.0.0.1', 'localhost')
+if ($resolvedHost -notin $anyAddress) {
+    $mine = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+    if ($resolvedHost -notin $mine) {
+        Write-Host "APP_HOST에 적힌 $resolvedHost 는 지금 이 PC의 주소가 아닙니다." -ForegroundColor Red
+        Write-Host '  Tailscale이 연결돼 있는지 확인하세요:  tailscale ip -4' -ForegroundColor Red
+        Write-Host "  이 PC의 주소: $($mine -join ', ')" -ForegroundColor Red
+        exit 1
+    }
+}
+
+if ($resolvedHost -notin @('127.0.0.1', 'localhost')) {
     Write-Host "이 PC 밖에서도 접속할 수 있는 주소로 엽니다: $resolvedHost`:$resolvedPort" -ForegroundColor Yellow
-    Write-Host '관리자 키(.env의 ADMIN_API_KEY)가 충분히 긴지 확인하세요.' -ForegroundColor Yellow
+    Write-Host '  관리자 키(.env의 ADMIN_API_KEY)가 충분히 긴지 확인하세요.' -ForegroundColor Yellow
+    $tailscaleIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceAlias -like '*Tailscale*' }).IPAddress
+    if ($tailscaleIp) {
+        Write-Host "  휴대폰에서:  http://$tailscaleIp`:$resolvedPort/admin" -ForegroundColor Yellow
+    }
 }
 
 Set-Location -LiteralPath $ProjectRoot
