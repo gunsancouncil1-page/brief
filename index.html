@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="군산시의회 주요 보도자료 스크랩과 AI 브리핑" />
+    <meta name="theme-color" content="#eef0ea" />
+    <title>군산시의회 주요 보도자료</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Serif+KR:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body data-mode="static">
+    <main class="shell">
+      <header class="masthead">
+        <div class="masthead-rule"></div>
+        <h1>군산시의회 주요 보도자료</h1>
+      </header>
+
+      <nav id="menu" class="nav" aria-label="주요 메뉴"></nav>
+
+      <section class="rail" aria-label="오늘의 일자 선택">
+        <span class="rail-label">오늘의 일자</span>
+        <div id="dateRail" class="chips" role="tablist"></div>
+      </section>
+
+      <section class="card" aria-live="polite">
+        <div class="card-head">
+          <div>
+            <h2 id="contentTitle" class="card-title"></h2>
+            <p id="contentNote" class="card-note"></p>
+          </div>
+        </div>
+
+        <div id="content">
+          <div class="skeleton-block">
+            <div class="skeleton skeleton-line"></div>
+            <div class="skeleton skeleton-line"></div>
+            <div class="skeleton skeleton-line"></div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="page-footer">
+        <span>제목을 누르면 해당 언론사 원문 기사로 이동합니다.</span>
+        <span class="footer-links" id="buildStamp"></span>
+      </footer>
+    </main>
+    <script src="./app.js" defer></script>
+  </body>
+</html>
