@@ -470,6 +470,9 @@ async function refresh() {
   loginCard.hidden = true;
   adminMain.hidden = false;
 
+  if (session.pages_url && !el("publishNote").textContent) {
+    setPublishNote(`승인 뒤 ‘사이트 게시’를 누르면 ${session.pages_url} 에 반영됩니다.`);
+  }
   el("scheduleNote").textContent = state.scheduler
     ? `평일 매일 ${state.collectAt} KST 자동 ${session.auto_register ? "등록·수집" : "수집"}`
     : "스케줄러 꺼짐 · 수동 실행만 가능";
@@ -593,6 +596,32 @@ el("runDueButton").addEventListener("click", async (event) => {
   } finally {
     button.disabled = false;
     await refresh();
+  }
+});
+
+function setPublishNote(text, isError = false) {
+  const box = el("publishNote");
+  box.textContent = text;
+  box.className = isError ? "hint error" : "hint";
+}
+
+el("publishButton").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "게시 중…";
+  setPublishNote("정적 사이트를 만들어 GitHub에 올리는 중입니다…");
+  try {
+    const result = await api("/api/admin/publish", { method: "POST" });
+    const summary = `${result.dates.length}일치 · 최신 ${result.latest_date || "없음"} · ${result.built_at.replace("T", " ")} 기준`;
+    setPublishNote(
+      `${result.message} ${summary}` + (result.pages_url ? ` · ${result.pages_url}` : ""),
+    );
+  } catch (error) {
+    setPublishNote(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
   }
 });
 

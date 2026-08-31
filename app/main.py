@@ -27,6 +27,7 @@ from app.services.job_runner import (
     report_window,
     requires_review,
 )
+from app.services.publisher import PublishError, pages_url, publish
 
 
 TEMPLATES = PROJECT_ROOT / "app" / "templates"
@@ -363,6 +364,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "timezone": str(settings.timezone),
             "scheduler": bool(app.state.scheduler),
             "auto_register": settings.auto_register,
+            "pages_url": pages_url(),
             "today": datetime.now(settings.timezone).date().isoformat(),
             "busy": runner.busy,
         }
@@ -500,6 +502,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def unapprove_job(job_id: str, _: bool = Depends(require_admin)):
         _job_or_404(job_id)
         return runner.unapprove(job_id)
+
+    @app.post("/api/admin/publish")
+    async def publish_site(_: bool = Depends(require_admin)):
+        """승인된 결과를 정적 사이트로 만들어 GitHub Pages에 올린다."""
+        try:
+            return await asyncio.to_thread(publish, database, settings)
+        except PublishError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
 
     @app.post("/api/admin/run-due")
     async def run_due(_: bool = Depends(require_admin)):
