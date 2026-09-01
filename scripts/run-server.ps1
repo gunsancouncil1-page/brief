@@ -56,4 +56,8 @@ if ($resolvedHost -notin @('127.0.0.1', 'localhost')) {
 }
 
 Set-Location -LiteralPath $ProjectRoot
+
+# uvicorn은 평범한 기록도 stderr로 내보낸다. 출력을 파일로 넘겨 실행할 때
+# 'Stop'인 채로 두면 첫 기록 줄에서 서버가 그대로 죽는다.
+$ErrorActionPreference = 'Continue'
 & $Python -m uvicorn app.main:app --host $resolvedHost --port $resolvedPort
