@@ -26,6 +26,7 @@ class Settings:
     data_dir: Path
     schedule_enabled: bool
     auto_register: bool
+    auto_publish: bool
     admin_api_key: str
     admin_session_hours: float
     origin_shared_secret: str
@@ -57,6 +58,7 @@ def load_settings() -> Settings:
         data_dir=data_dir,
         schedule_enabled=_as_bool(os.getenv("SCHEDULE_ENABLED"), True),
         auto_register=_as_bool(os.getenv("AUTO_REGISTER"), True),
+        auto_publish=_as_bool(os.getenv("AUTO_PUBLISH"), True),
         admin_api_key=os.getenv("ADMIN_API_KEY", ""),
         admin_session_hours=float(os.getenv("ADMIN_SESSION_HOURS", "12")),
         origin_shared_secret=os.getenv("ORIGIN_SHARED_SECRET", ""),

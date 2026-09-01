@@ -464,7 +464,9 @@ async function openReview(jobId) {
 async function approveReview() {
   if (!state.review) return;
   const button = el("approveButton");
+  const label = button.textContent;
   button.disabled = true;
+  button.textContent = "승인하고 게시하는 중…";
   try {
     const result = await api(`/api/admin/jobs/${state.review.id}/approve`, {
       method: "POST",
@@ -475,7 +477,9 @@ async function approveReview() {
     });
     setMessage(
       `승인 완료 · ${result.published_count}건 공개, ${result.excluded_count}건 제외` +
-        (result.briefing_status === "fallback" ? " (LLM 응답 없음, 확인 목록으로 대체)" : ""),
+        (result.briefing_status === "fallback" ? " (LLM 응답 없음, 확인 목록으로 대체)" : "") +
+        publishSummary(result.publish),
+      result.publish ? result.publish.status === "failed" : false,
     );
     state.review = null;
     renderReview();
@@ -483,6 +487,7 @@ async function approveReview() {
   } catch (error) {
     setReviewMessage(error.message, true);
   } finally {
+    button.textContent = label;
     button.disabled = false;
   }
 }
@@ -590,7 +595,7 @@ async function refresh() {
   adminMain.hidden = false;
 
   if (session.pages_url && !el("publishNote").textContent) {
-    setPublishNote(`승인 뒤 ‘사이트 게시’를 누르면 ${session.pages_url} 에 반영됩니다.`);
+    setPublishNote(`승인하면 ${session.pages_url} 에 자동으로 게시됩니다. ‘사이트 게시’로 언제든 다시 올릴 수 있습니다.`);
   }
   el("scheduleNote").textContent = state.scheduler
     ? `평일 매일 ${state.collectAt} KST 자동 ${session.auto_register ? "등록·수집" : "수집"}`
@@ -614,6 +619,16 @@ async function refresh() {
   }
 }
 
+/* 승인·수집 결과에 딸려 오는 사이트 게시 결과를 한 줄로 옮긴다. */
+function publishSummary(publish) {
+  if (!publish) return "";
+  if (publish.status === "ok") {
+    return publish.pushed ? " · 사이트 게시 완료" : ` · 사이트 게시: ${publish.message || "바뀐 내용 없음"}`;
+  }
+  if (publish.status === "skipped") return " · 사이트 게시는 꺼져 있습니다";
+  return ` · 사이트 게시 실패(${publish.message}) — ‘사이트 게시’로 다시 시도하세요`;
+}
+
 async function runJob(jobId, button) {
   const original = button.textContent;
   button.disabled = true;
@@ -622,9 +637,11 @@ async function runJob(jobId, button) {
     const result = await api(`/api/admin/jobs/${jobId}/run`, { method: "POST" });
     setMessage(
       result.status === "complete"
-        ? `수집 완료 · 전체 ${result.article_count}건, 중복 제거 ${result.unique_count}건`
+        ? `수집 완료 · 전체 ${result.article_count}건, 중복 제거 ${result.unique_count}건` +
+          (result.approved ? " · 자동 승인" : "") +
+          publishSummary(result.publish)
         : `수집 실패 · ${result.error}`,
-      result.status !== "complete",
+      result.status !== "complete" || (result.publish && result.publish.status === "failed"),
     );
   } catch (error) {
     setMessage(error.message, true);
@@ -710,7 +727,10 @@ el("runDueButton").addEventListener("click", async (event) => {
   button.disabled = true;
   try {
     const result = await api("/api/admin/run-due", { method: "POST" });
-    setMessage(`밀린 수집 ${result.job_count}건을 실행했습니다.`);
+    setMessage(
+      `밀린 수집 ${result.job_count}건을 실행했습니다.` + publishSummary(result.publish),
+      Boolean(result.publish && result.publish.status === "failed"),
+    );
   } catch (error) {
     setMessage(error.message, true);
   } finally {

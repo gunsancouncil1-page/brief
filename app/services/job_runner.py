@@ -17,6 +17,7 @@ from app.services.crawler import (
     SearchSpec,
     fetch_linked_article,
 )
+from app.services.publisher import PublishError, publish
 
 
 def requires_review(job: dict[str, Any], overrides: dict[str, bool] | None = None) -> bool:
@@ -53,6 +54,8 @@ class JobRunner:
         self.collector = GoogleNewsRssCollector(settings)
         self.duplicate_detector = DuplicateDetector()
         self.briefing_service = BriefingService(settings)
+        # 시험에서 갈아 끼울 수 있도록 게시 함수를 속성으로 둔다.
+        self.site_publisher = publish
         self._lock = asyncio.Lock()
 
     @property
@@ -62,6 +65,27 @@ class JobRunner:
     def review_required(self, job: dict[str, Any]) -> bool:
         """관리자가 정한 지금의 공개 방식으로 판단한다."""
         return requires_review(job, self.database.section_review_flags())
+
+    async def publish_site(self) -> dict[str, Any]:
+        """승인된 결과를 정적 사이트로 만들어 GitHub Pages에 올린다.
+
+        게시에 실패해도 승인 자체는 이미 저장돼 있다. 실패를 위로 던지지 않고
+        결과에 담아 돌려주어, 관리자가 '사이트 게시'로 다시 시도할 수 있게 한다.
+        """
+        if not self.settings.auto_publish:
+            return {"status": "skipped", "message": "자동 게시가 꺼져 있습니다(AUTO_PUBLISH)."}
+        try:
+            result = await asyncio.to_thread(self.site_publisher, self.database, self.settings)
+        except PublishError as error:
+            return {"status": "failed", "message": str(error)}
+        except Exception as error:  # noqa: BLE001 - 게시 실패가 승인을 무르게 하면 안 된다
+            return {"status": "failed", "message": f"{type(error).__name__}: {error}"}
+        return {
+            "status": "ok",
+            "pushed": bool(result.get("pushed")),
+            "pages_url": result.get("pages_url"),
+            "message": result.get("message") or "",
+        }
 
     def job_dir(self, job: dict[str, Any]) -> Path:
         return self.settings.media_dir / job["report_date"] / job["id"]
@@ -118,15 +142,19 @@ class JobRunner:
                 results.append({"job_id": job["id"], "status": "skipped", "error": "주말은 수집하지 않습니다."})
                 continue
             try:
-                results.append(await self.run_job(job["id"]))
+                results.append(await self.run_job(job["id"], publish_after=False))
             except RuntimeError as error:
                 # Another run holds the lock. The job stays pending, so the next
                 # 05:00 pass (or a manual run) picks it up instead of the batch
                 # stopping here.
                 results.append({"job_id": job["id"], "status": "skipped", "error": str(error)})
-        return {"ran_at": moment.isoformat(), "job_count": len(results), "jobs": results}
+        batch = {"ran_at": moment.isoformat(), "job_count": len(results), "jobs": results}
+        # 자동 승인된 갈래가 하나라도 있으면 사이트를 한 번만 올린다.
+        if any(item.get("approved") for item in results):
+            batch["publish"] = await self.publish_site()
+        return batch
 
-    async def run_job(self, job_id: str) -> dict[str, Any]:
+    async def run_job(self, job_id: str, *, publish_after: bool = True) -> dict[str, Any]:
         job = self.database.get_job(job_id)
         if job is None:
             raise LookupError("Unknown job")
@@ -136,7 +164,7 @@ class JobRunner:
         async with self._lock:
             self.database.update_job_run(job_id, status="running", error_message=None)
             try:
-                result = await self._collect(job)
+                result = await self._collect(job, publish_after=publish_after)
             except Exception as error:  # noqa: BLE001 - recorded on the job row
                 message = f"{type(error).__name__}: {error}"
                 existing = self.database.articles(job_id)
@@ -170,7 +198,7 @@ class JobRunner:
             if stored.name not in referenced:
                 stored.unlink(missing_ok=True)
 
-    async def _collect(self, job: dict[str, Any]) -> dict[str, Any]:
+    async def _collect(self, job: dict[str, Any], *, publish_after: bool = True) -> dict[str, Any]:
         job_id = job["id"]
         spec = SearchSpec.from_job(job)
         start = datetime.fromisoformat(job["window_start"])
@@ -221,10 +249,14 @@ class JobRunner:
                 for article in self.database.articles(job_id)
                 if article["sort_order"]
             ]
-            approval = await self.approve(job_id, kept_out, kept_order)
+            approval = await self.approve(
+                job_id, kept_out, kept_order, publish_after=publish_after
+            )
             result["approved"] = True
             result["published_count"] = approval["published_count"]
             result["briefing_status"] = approval["briefing_status"]
+            if "publish" in approval:
+                result["publish"] = approval["publish"]
         return result
 
     async def add_linked_article(self, job_id: str, url: str) -> dict[str, Any]:
@@ -294,6 +326,8 @@ class JobRunner:
         job_id: str,
         excluded_ids: list[str],
         ordered_ids: list[str] | None = None,
+        *,
+        publish_after: bool = True,
     ) -> dict[str, Any]:
         """관리자가 뺀 기사와 정한 순서를 반영하고, 남은 기사로 브리핑을 만든 뒤 공개한다.
 
@@ -317,7 +351,7 @@ class JobRunner:
             briefing_status = briefing["status"]
 
         self.database.set_approved(job_id, True)
-        return {
+        result = {
             "job_id": job_id,
             "approved": True,
             "published_count": len(published),
@@ -325,6 +359,10 @@ class JobRunner:
             "ordered_count": ordered_count,
             "briefing_status": briefing_status,
         }
+        # 승인은 곧 공개다. 사이트 게시까지 이어서 마친다.
+        if publish_after:
+            result["publish"] = await self.publish_site()
+        return result
 
     def unapprove(self, job_id: str) -> dict[str, Any]:
         """공개를 내리고 다시 검토 상태로 되돌린다."""

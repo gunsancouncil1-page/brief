@@ -24,10 +24,13 @@ from app.services.crawler import (
 )
 from app.services.images import _normalize, body_image_urls
 from app.services.job_runner import JobRunner, is_collection_day, report_window
+from app.services.publisher import PublishError
 from app.services.site_builder import build_site
 
 
-def make_settings(tmp_path: Path, *, auto_register: bool = False) -> Settings:
+def make_settings(
+    tmp_path: Path, *, auto_register: bool = False, auto_publish: bool = False
+) -> Settings:
     return Settings(
         host="127.0.0.1",
         port=8000,
@@ -35,6 +38,7 @@ def make_settings(tmp_path: Path, *, auto_register: bool = False) -> Settings:
         data_dir=tmp_path / "storage",
         schedule_enabled=False,
         auto_register=auto_register,
+        auto_publish=auto_publish,
         admin_api_key="test-key",
         admin_session_hours=1,
         origin_shared_secret="",
@@ -1097,3 +1101,132 @@ def test_public_menu_reports_the_current_publishing_mode(tmp_path: Path):
     build_site(Database(settings.database_path), settings, site)
     index = json.loads((site / "data" / "index.json").read_text(encoding="utf-8"))
     assert index["sections"]["council"]["requires_review"] is False
+
+
+def _stub_publisher(monkeypatch, error: Exception | None = None):
+    """게시 함수를 가짜로 바꾼다. 시험에서 git을 건드리지 않기 위해서다."""
+    calls: list[str] = []
+
+    def fake_publish(database, settings, **kwargs):
+        calls.append(datetime.now(UTC).isoformat())
+        if error:
+            raise error
+        return {
+            "pushed": True,
+            "pages_url": "https://example.github.io/brief/",
+            "message": "",
+            "built_at": "2026-08-25T05:10",
+            "latest_date": "2026-08-25",
+        }
+
+    monkeypatch.setattr("app.services.job_runner.publish", fake_publish)
+    return calls
+
+
+def _council_job_with_one_article(client, settings, *, section: str = "council") -> dict:
+    job = client.post(
+        "/api/admin/jobs",
+        json={"report_date": "2026-08-25", "section": section, "generate_briefing": False},
+    ).json()["job"]
+    Database(settings.database_path).upsert_article(
+        sample_article(
+            job["id"], f"{section}-0", f"https://www.jjan.kr/{section}/1", "전북일보",
+            DISTINCT_BODIES[0], content_hash=f"hash-{section}",
+        )
+    )
+    return job
+
+
+def test_manual_approval_publishes_the_site(tmp_path: Path, monkeypatch):
+    """검토 뒤 승인하면 게시까지 이어서 끝낸다."""
+    calls = _stub_publisher(monkeypatch)
+    settings = make_settings(tmp_path, auto_publish=True)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = _council_job_with_one_article(client, settings)
+
+        # 수집만으로는 게시하지 않는다. 군산시의회는 승인을 기다린다.
+        assert client.post(f"/api/admin/jobs/{job['id']}/run").json()["approved"] is False
+        assert calls == []
+
+        result = client.post(
+            f"/api/admin/jobs/{job['id']}/approve", json={"excluded_ids": []}
+        ).json()
+        assert result["approved"] is True
+        assert result["publish"] == {
+            "status": "ok",
+            "pushed": True,
+            "pages_url": "https://example.github.io/brief/",
+            "message": "",
+        }
+        assert len(calls) == 1
+
+
+def test_auto_approved_menu_publishes_without_the_admin(tmp_path: Path, monkeypatch):
+    """자동 승인 갈래는 수집·승인에 이어 게시까지 혼자 끝낸다."""
+    calls = _stub_publisher(monkeypatch)
+    settings = make_settings(tmp_path, auto_publish=True)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = _council_job_with_one_article(client, settings, section="cityhall")
+
+        result = client.post(f"/api/admin/jobs/{job['id']}/run").json()
+        assert result["approved"] is True
+        assert result["publish"]["status"] == "ok"
+        assert len(calls) == 1
+
+
+def test_batch_run_publishes_once_for_every_menu(tmp_path: Path, monkeypatch):
+    """밀린 수집을 한꺼번에 돌려도 게시는 마지막에 한 번만 한다."""
+    calls = _stub_publisher(monkeypatch)
+    settings = make_settings(tmp_path, auto_publish=True)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        created = client.post(
+            "/api/admin/jobs/bulk",
+            json={"report_date": "2026-08-25", "sections": ["cityhall", "broadcast", "council"]},
+        ).json()
+        assert len(created["created"]) == 3
+
+        payload = client.post("/api/admin/run-due").json()
+        assert payload["job_count"] == 3
+        # 자동 승인 두 갈래가 공개됐지만 게시는 한 번이다.
+        assert len(calls) == 1
+        assert payload["publish"]["status"] == "ok"
+
+
+def test_failed_publishing_does_not_undo_the_approval(tmp_path: Path, monkeypatch):
+    """게시가 실패해도 승인은 그대로 남고, 이유를 알려 준다."""
+    _stub_publisher(monkeypatch, error=PublishError("원격 저장소에 접근할 수 없습니다."))
+    settings = make_settings(tmp_path, auto_publish=True)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = _council_job_with_one_article(client, settings)
+        client.post(f"/api/admin/jobs/{job['id']}/run")
+
+        result = client.post(
+            f"/api/admin/jobs/{job['id']}/approve", json={"excluded_ids": []}
+        ).json()
+        assert result["approved"] is True
+        assert result["publish"] == {
+            "status": "failed",
+            "message": "원격 저장소에 접근할 수 없습니다.",
+        }
+        # 승인은 저장돼 있으므로 공개 화면에는 이미 올라가 있다.
+        published = client.get("/api/reports/2026-08-25/council/articles").json()["articles"]
+        assert len(published) == 1
+
+
+def test_auto_publish_can_be_turned_off(tmp_path: Path, monkeypatch):
+    """AUTO_PUBLISH가 꺼져 있으면 승인만 하고 게시는 관리자가 직접 한다."""
+    calls = _stub_publisher(monkeypatch)
+    settings = make_settings(tmp_path, auto_publish=False)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        job = _council_job_with_one_article(client, settings)
+        client.post(f"/api/admin/jobs/{job['id']}/run")
+        result = client.post(
+            f"/api/admin/jobs/{job['id']}/approve", json={"excluded_ids": []}
+        ).json()
+        assert result["publish"]["status"] == "skipped"
+        assert calls == []
