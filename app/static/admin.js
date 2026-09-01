@@ -639,6 +639,7 @@ async function runJob(jobId, button) {
       result.status === "complete"
         ? `수집 완료 · 전체 ${result.article_count}건, 중복 제거 ${result.unique_count}건` +
           (result.approved ? " · 자동 승인" : "") +
+          (result.purged_dates ? ` · 이전 ${result.purged_dates.length}일치 정리` : "") +
           publishSummary(result.publish)
         : `수집 실패 · ${result.error}`,
       result.status !== "complete" || (result.publish && result.publish.status === "failed"),

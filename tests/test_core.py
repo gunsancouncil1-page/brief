@@ -29,7 +29,11 @@ from app.services.site_builder import build_site
 
 
 def make_settings(
-    tmp_path: Path, *, auto_register: bool = False, auto_publish: bool = False
+    tmp_path: Path,
+    *,
+    auto_register: bool = False,
+    auto_publish: bool = False,
+    purge_previous_dates: bool = False,
 ) -> Settings:
     return Settings(
         host="127.0.0.1",
@@ -39,6 +43,7 @@ def make_settings(
         schedule_enabled=False,
         auto_register=auto_register,
         auto_publish=auto_publish,
+        purge_previous_dates=purge_previous_dates,
         admin_api_key="test-key",
         admin_session_hours=1,
         origin_shared_secret="",
@@ -1230,3 +1235,53 @@ def test_auto_publish_can_be_turned_off(tmp_path: Path, monkeypatch):
         ).json()
         assert result["publish"]["status"] == "skipped"
         assert calls == []
+
+
+def test_todays_run_clears_the_earlier_dates(tmp_path: Path, monkeypatch):
+    """오늘 수집이 끝나면 이전 날짜 스크랩은 기사·사진까지 지워진다."""
+    _stub_publisher(monkeypatch)
+    settings = make_settings(tmp_path, auto_publish=True, purge_previous_dates=True)
+    database = Database(settings.database_path)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+
+        old = _council_job_with_one_article(client, settings, section="cityhall")
+        client.post(f"/api/admin/jobs/{old['id']}/run")
+        stale_media = settings.media_dir / "2026-08-25"
+        stale_media.mkdir(parents=True, exist_ok=True)
+        (stale_media / "keep.jpg").write_bytes(b"x")
+        assert database.dates() == ["2026-08-25"]
+
+        # 다음 날짜(수요일) 수집이 끝나는 순간 앞선 날짜가 정리된다.
+        fresh = client.post(
+            "/api/admin/jobs",
+            json={"report_date": "2026-08-26", "section": "cityhall", "generate_briefing": False},
+        ).json()["job"]
+        result = client.post(f"/api/admin/jobs/{fresh['id']}/run").json()
+
+        assert result["purged_dates"] == ["2026-08-25"]
+        assert database.dates() == ["2026-08-26"]
+        assert database.articles(old["id"]) == []
+        assert not stale_media.exists()
+
+        # 관리자 화면 목록에도 오늘 몫만 남는다.
+        listed = client.get("/api/admin/jobs").json()["jobs"]
+        assert {job["report_date"] for job in listed} == {"2026-08-26"}
+
+
+def test_previous_dates_are_kept_when_purging_is_off(tmp_path: Path, monkeypatch):
+    """PURGE_PREVIOUS_DATES를 끄면 예전처럼 지난 날짜가 남는다."""
+    _stub_publisher(monkeypatch)
+    settings = make_settings(tmp_path, auto_publish=True, purge_previous_dates=False)
+    with TestClient(create_app(settings)) as client:
+        client.post("/api/admin/login", json={"key": "test-key"})
+        old = _council_job_with_one_article(client, settings, section="cityhall")
+        client.post(f"/api/admin/jobs/{old['id']}/run")
+        fresh = client.post(
+            "/api/admin/jobs",
+            json={"report_date": "2026-08-26", "section": "cityhall", "generate_briefing": False},
+        ).json()["job"]
+        result = client.post(f"/api/admin/jobs/{fresh['id']}/run").json()
+
+        assert "purged_dates" not in result
+        assert Database(settings.database_path).dates() == ["2026-08-26", "2026-08-25"]

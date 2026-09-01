@@ -322,6 +322,23 @@ class Database:
             cursor = conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
         return cursor.rowcount > 0
 
+    def delete_jobs_before(self, report_date: str) -> list[str]:
+        """이 날짜보다 앞선 수집을 통째로 지운다. 지운 날짜를 돌려준다.
+
+        기사·사진·브리핑은 외래키를 타고 함께 지워진다.
+        """
+        with self.connection() as conn:
+            dates = [
+                row["report_date"]
+                for row in conn.execute(
+                    "SELECT DISTINCT report_date FROM jobs WHERE report_date < ? ORDER BY report_date",
+                    (report_date,),
+                )
+            ]
+            if dates:
+                conn.execute("DELETE FROM jobs WHERE report_date < ?", (report_date,))
+        return dates
+
     def update_job_run(
         self,
         job_id: str,

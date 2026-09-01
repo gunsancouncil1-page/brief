@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,18 @@ class JobRunner:
     def review_required(self, job: dict[str, Any]) -> bool:
         """관리자가 정한 지금의 공개 방식으로 판단한다."""
         return requires_review(job, self.database.section_review_flags())
+
+    def purge_previous_dates(self, report_date: str) -> list[str]:
+        """이 날짜보다 앞선 스크랩을 지운다. 화면에는 오늘 몫만 남긴다.
+
+        오늘 수집이 끝난 뒤에 부른다. 기사와 사진, 브리핑까지 함께 지운다.
+        """
+        if not self.settings.purge_previous_dates:
+            return []
+        removed = self.database.delete_jobs_before(report_date)
+        for stale_date in removed:
+            shutil.rmtree(self.settings.media_dir / stale_date, ignore_errors=True)
+        return removed
 
     async def publish_site(self) -> dict[str, Any]:
         """승인된 결과를 정적 사이트로 만들어 GitHub Pages에 올린다.
@@ -239,6 +252,13 @@ class JobRunner:
             "article_count": total_count,
             "unique_count": unique_count,
         }
+
+        # 오늘 몫이 끝났으면 지난 날짜는 남겨 두지 않는다. 게시보다 먼저 지워야
+        # 사이트에도 오늘 것만 올라간다.
+        purged = self.purge_previous_dates(job["report_date"])
+        if purged:
+            result["purged_dates"] = purged
+
         if not self.review_required(job):
             # 관리자가 예전에 빼 둔 기사가 있으면 그대로 유지한 채 다시 공개한다.
             kept_out = [
