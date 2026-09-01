@@ -48,8 +48,9 @@ if ($resolvedHost -notin $anyAddress) {
 if ($resolvedHost -notin @('127.0.0.1', 'localhost')) {
     Write-Host "이 PC 밖에서도 접속할 수 있는 주소로 엽니다: $resolvedHost`:$resolvedPort" -ForegroundColor Yellow
     Write-Host '  관리자 키(.env의 ADMIN_API_KEY)가 충분히 긴지 확인하세요.' -ForegroundColor Yellow
+    # Tailscale이 연결되기 전에는 169.254.x.x(자동 사설 주소)가 잡힌다. 그건 쓸 수 없다.
     $tailscaleIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceAlias -like '*Tailscale*' }).IPAddress
+        Where-Object { $_.InterfaceAlias -like '*Tailscale*' -and $_.IPAddress -notlike '169.254.*' }).IPAddress
     if ($tailscaleIp) {
         Write-Host "  휴대폰에서:  http://$tailscaleIp`:$resolvedPort/admin" -ForegroundColor Yellow
     }
