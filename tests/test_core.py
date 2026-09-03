@@ -12,9 +12,16 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.database import Database
 from app.main import create_app
-from app.sections import LOCAL_PRESS, MENU, SECTIONS, SiteListing
+from app.sections import LOCAL_PRESS, MENU, SECTION_LISTINGS, SECTIONS, SiteListing
 from app.security import issue_session, verify_session
-from app.services.briefing import strip_dropped_sections
+from app.services.briefing import (
+    CONTEXT_BUDGET,
+    MAX_ARTICLES,
+    BriefingService,
+    append_uncited,
+    cited_articles,
+    strip_dropped_sections,
+)
 from app.services.crawler import (
     DuplicateDetector,
     SearchSpec,
@@ -1440,3 +1447,57 @@ def test_listing_links_are_deduplicated_and_made_absolute():
         "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=1",
         "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=2",
     ]
+
+
+def test_broadcast_tab_reads_the_stations_own_pages():
+    """전주MBC·JTV·금강방송은 지면을 직접 읽는다. 전주KBS는 검색에 맡긴다."""
+    names = [listing.name for listing in SECTION_LISTINGS["broadcast"]]
+    assert names == ["전주MBC", "JTV 전주방송", "금강방송"]
+    assert {"news.kbs.co.kr", "jmbc.co.kr", "jtv.co.kr", "kcn.tv"} == set(SECTIONS["broadcast"].sites)
+
+    # 금강방송만 예전 방식의 TLS를 쓴다. 다른 곳에는 낮춘 설정을 쓰지 않는다.
+    relaxed = {listing.name for listing in SECTION_LISTINGS["broadcast"] if listing.relaxed_tls}
+    assert relaxed == {"금강방송"}
+
+    # 방송사 지면은 <title>에 방송사 이름만 넣어 두는 곳이 있다.
+    seoul = ZoneInfo("Asia/Seoul")
+    html = """<html><head><title>JTV</title></head><body>
+    <h1>뉴스</h1><h1>군산 건설기계연구원, 배터리 시험 중 굴착기 화재</h1>
+    <span>2026-09-02 20:30</span></body></html>"""
+    meta = page_metadata(html, "https://www.jtv.co.kr/news/article.php?id=1", seoul)
+    assert meta["title"] == "군산 건설기계연구원, 배터리 시험 중 굴착기 화재"
+    assert meta["publisher"] == "JTV 전주방송"
+
+
+def test_briefing_prompt_keeps_every_article_inside_the_context():
+    """기사가 많은 날에도 전체가 한 번에 모델에 들어가야 한다."""
+    def articles(count: int) -> list[dict]:
+        return [
+            {
+                "content": "가" * 4000, "summary": "", "title": f"제목{index}",
+                "publisher": "군산뉴스", "published_at": "2026-09-02T18:00:00+09:00",
+                "source_url": f"https://example.com/{index}",
+            }
+            for index in range(count)
+        ]
+
+    for count in (2, 24, 40):
+        context = BriefingService._context(articles(count))
+        assert context.count("[기사 ") == count
+        assert len(context) <= CONTEXT_BUDGET + 2000
+
+    # 아주 많은 날은 상한까지만 넣는다. 문맥을 넘기면 앞쪽 기사가 잘려 나간다.
+    assert BriefingService._context(articles(90)).count("[기사 ") == MAX_ARTICLES
+
+
+def test_briefing_adds_back_articles_the_model_skipped():
+    """모델이 빠뜨린 기사는 제목만이라도 브리핑 끝에 붙인다."""
+    body = "# 주요 내용\n- 연수 취소 [기사 1, 기사 3]\n- 급식소 신축 [기사 2]"
+    articles = [
+        {"title": f"제목{index}", "publisher": "군산뉴스"} for index in range(1, 5)
+    ]
+    assert cited_articles(body) == {1, 2, 3}
+    completed = append_uncited(body, articles)
+    assert completed.endswith("- 제목4 (군산뉴스) [기사 4]")
+    # 이미 다 인용했으면 그대로 둔다.
+    assert append_uncited(body, articles[:3]) == body

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+import ssl
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -418,10 +419,28 @@ def _recent_date_in_text(text: str, timezone) -> datetime | None:
     return None
 
 
+def _longest_heading(soup: BeautifulSoup) -> str:
+    """지면에서 기사 제목으로 보이는 가장 긴 머리글."""
+    best = ""
+    for tag in soup.find_all(["h1", "h2"]):
+        text = clean_html(tag.get_text(" ", strip=True))
+        if 10 <= len(text) <= 120 and len(text) > len(best):
+            best = text
+    return best
+
+
 def page_metadata(html: str, url: str, timezone) -> dict[str, Any]:
     """원문 페이지에서 제목, 매체, 발행 시각을 읽어 낸다."""
     soup = BeautifulSoup(html or "", "html.parser")
     document_title = clean_html(soup.title.string) if soup.title and soup.title.string else ""
+
+    publisher = (
+        publisher_for(url)
+        or clean_html(_meta_value(soup, "og:site_name"))
+        or clean_html(_meta_value(soup, "publisher"))
+        or _title_publisher(document_title)
+        or re.sub(r"^www\.", "", urlparse(url).netloc)
+    )
 
     # 지역 매체 중에는 <title>에 기사 제목 대신 신문 이름만 적어 두는 곳이 있다.
     # trafilatura는 그런 지면에서도 본문 머리의 제목을 잘 찾아낸다.
@@ -441,6 +460,9 @@ def page_metadata(html: str, url: str, timezone) -> dict[str, Any]:
     if len(title) > 20:
         title = TITLE_TAIL.split(title)[0].strip() or title
     title = title.strip(" -–|>")
+    # 방송사 지면은 <title>에 방송사 이름이나 표어만 넣어 두는 곳이 있다.
+    if len(title) < 10 or "::" in title or title == publisher:
+        title = _longest_heading(soup) or title
 
     published_at = None
     for key in DATE_META_KEYS:
@@ -468,13 +490,6 @@ def page_metadata(html: str, url: str, timezone) -> dict[str, Any]:
         if not published_at:
             published_at = _recent_date_in_text(text[:2000], timezone)
 
-    publisher = (
-        publisher_for(url)
-        or clean_html(_meta_value(soup, "og:site_name"))
-        or clean_html(_meta_value(soup, "publisher"))
-        or _title_publisher(document_title)
-        or re.sub(r"^www\.", "", urlparse(url).netloc)
-    )
     return {
         "title": title,
         "publisher": publisher,
@@ -725,19 +740,33 @@ class SiteListingCollector:
         if not listings or not spec.keywords or not self.settings.rss_enabled:
             return []
 
-        headers = {"User-Agent": self.settings.user_agent}
-        timeout = httpx.Timeout(self.settings.request_timeout_seconds)
         articles: list[dict[str, Any]] = []
-        async with httpx.AsyncClient(
-            headers=headers, timeout=timeout, follow_redirects=True
-        ) as client:
-            for listing in listings:
-                try:
+        for listing in listings:
+            try:
+                async with self._client(listing) as client:
                     articles += await self._collect_one(client, listing, spec, job_id, start, end)
-                except httpx.HTTPError:
-                    # 한 신문이 응답하지 않아도 나머지 수집은 계속한다.
-                    continue
+            except (httpx.HTTPError, ssl.SSLError):
+                # 한 곳이 응답하지 않아도 나머지 수집은 계속한다.
+                continue
         return articles
+
+    def _client(self, listing: SiteListing) -> httpx.AsyncClient:
+        """지면 하나를 읽을 클라이언트.
+
+        금강방송(kcn.tv)은 예전 방식의 TLS 키를 쓰기 때문에 요즘 기본 설정으로는
+        연결조차 되지 않는다. 공개된 기사 지면을 읽는 용도로만 수준을 낮춘다.
+        """
+        verify: Any = True
+        if listing.relaxed_tls:
+            context = httpx.create_ssl_context(verify=False)
+            context.set_ciphers("DEFAULT@SECLEVEL=1")
+            verify = context
+        return httpx.AsyncClient(
+            headers={"User-Agent": self.settings.user_agent},
+            timeout=httpx.Timeout(self.settings.request_timeout_seconds),
+            follow_redirects=True,
+            verify=verify,
+        )
 
     async def _collect_one(
         self,

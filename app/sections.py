@@ -82,6 +82,8 @@ class SiteListing:
     list_url: str
     # 목록에서 기사 링크를 골라내는 조각. 주소에 이 문자열이 들어가면 기사로 본다.
     article_mark: str
+    # 오래된 TLS 설정을 쓰는 지면(금강방송)은 보안 수준을 낮춰야 연결된다.
+    relaxed_tls: bool = False
 
 
 # 군산 지역지 두 곳은 Google 뉴스에 기사가 거의 올라오지 않는다.
@@ -92,10 +94,21 @@ LOCAL_LISTINGS: tuple[SiteListing, ...] = (
 )
 
 
+# 전북 지역 방송사도 Google 뉴스 색인만으로는 빠지는 곳이 많다.
+# 특히 JTV와 금강방송은 검색에 거의 걸리지 않아 지면을 직접 읽는다.
+# 전주KBS는 지면이 자바스크립트로 그려져 목록을 읽을 수 없어 검색에 맡긴다.
+BROADCAST_LISTINGS: tuple[SiteListing, ...] = (
+    SiteListing("전주MBC", "https://www.jmbc.co.kr/news", "/news/view/"),
+    SiteListing("JTV 전주방송", "https://www.jtv.co.kr/news/", "article.php"),
+    SiteListing("금강방송", "https://kcn.tv/?r=home&c=1/2", "uid=", relaxed_tls=True),
+)
+
+
 # 갈래별로 직접 훑을 지면. 검색 결과와 합쳐서 쓴다.
 SECTION_LISTINGS: dict[str, tuple[SiteListing, ...]] = {
     "council": LOCAL_LISTINGS,
     "cityhall": LOCAL_LISTINGS,
+    "broadcast": BROADCAST_LISTINGS,
 }
 
 
