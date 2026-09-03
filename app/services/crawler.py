@@ -11,7 +11,7 @@ from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import httpx
@@ -21,7 +21,7 @@ from rapidfuzz import fuzz
 
 from app.config import Settings
 from app.database import Database
-from app.sections import publisher_for
+from app.sections import SiteListing, publisher_for
 from app.services.images import collect_article_images
 
 
@@ -157,6 +157,43 @@ def source_title(entry: Any) -> str:
     if " - " in title and entry.get("source"):
         return title.rsplit(" - ", 1)[0]
     return title
+
+
+META_CHARSET = re.compile(rb"""charset\s*=\s*["']?\s*([A-Za-z0-9_\-]+)""", re.IGNORECASE)
+
+
+def decode_html(response: httpx.Response) -> str:
+    """받아 온 페이지를 그 페이지의 실제 인코딩으로 읽는다.
+
+    지역 매체 상당수가 EUC-KR을 쓰면서 charset을 헤더가 아닌 <meta> 태그에만
+    적어 둔다. 그때 httpx는 UTF-8로 넘겨짚어 본문이 통째로 깨진다.
+    """
+    raw = response.content
+    if not raw:
+        return ""
+
+    candidates: list[str] = []
+    if response.charset_encoding:
+        candidates.append(response.charset_encoding)
+    declared = META_CHARSET.search(raw[:4096])
+    if declared:
+        candidates.append(declared.group(1).decode("ascii", "ignore"))
+    # cp949는 euc-kr을 품는다. 확장 글자가 섞여도 이쪽으로 읽힌다.
+    candidates += ["utf-8", "cp949"]
+
+    seen: set[str] = set()
+    for name in candidates:
+        key = name.lower().replace("_", "-")
+        if key in {"euc-kr", "ks-c-5601-1987", "ksc5601"}:
+            key = "cp949"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            return raw.decode(key)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", "replace")
 
 
 GOOGLE_NEWS_HOST = "news.google.com"
@@ -311,9 +348,9 @@ def parse_datetime_text(raw: str, timezone) -> datetime | None:
     return parsed.astimezone(timezone)
 
 
-TITLE_TAIL = re.compile(r"\s*[|·>]\s*|\s+-\s+(?=[^-]{2,20}$)")
+TITLE_TAIL = re.compile(r"\s*[|>]\s*|\s+-\s+(?=[^-]{2,20}$)")
 # 제목 끝에 붙은 매체 이름. "기사 제목 - 군산신문"의 뒷부분을 집는다.
-TITLE_PUBLISHER = re.compile(r"[|·>\-–]\s*([^|·>\-–]{2,20}?)\s*$")
+TITLE_PUBLISHER = re.compile(r"[|>\-–]\s*([^|>\-–]{2,20}?)\s*$")
 # 본문 위쪽의 "입력 2026.08.29 17:59" 같은 표기.
 LABELED_DATE = re.compile(
     r"(?:입력|등록|송고|작성|승인|발행|기사입력)\s*[:]?\s*"
@@ -331,16 +368,52 @@ def _title_publisher(raw_title: str) -> str:
     return tail if tail and tail.count(" ") <= 1 else ""
 
 
-def _recent_date_in_text(text: str, timezone) -> datetime | None:
-    """시각 표기가 아예 없을 때, 지면 위쪽에 적힌 날짜를 마지막으로 찾아본다.
+def _trafilatura_metadata(html: str, url: str) -> dict[str, str]:
+    try:
+        found = trafilatura.extract_metadata(html, default_url=url)
+    except Exception:  # noqa: BLE001 - 지면이 이상해도 나머지 방법으로 계속 간다
+        return {}
+    if not found:
+        return {}
+    values = found.as_dict()
+    return {
+        "title": (values.get("title") or "").strip(),
+        "date": (values.get("date") or "").strip(),
+    }
 
-    저작권 표기 연도나 다른 기사 목록의 날짜를 잘못 집지 않도록,
-    최근 두 달 안쪽의 날짜만 받아들인다.
-    """
-    now = datetime.now(UTC).astimezone(timezone)
-    for match in KOREAN_DATE.finditer(text):
+
+# "최종업데이트 2026년 09월 03일(목) 10:43"처럼 지면 전체에 찍히는 시각이 있다.
+# 기사 발행 시각이 아니므로 건너뛴다.
+SITE_STAMP = ("업데이트", "최종수정", "현재", "오늘")
+
+
+def _plain_datetime_in_text(text: str, timezone) -> datetime | None:
+    """지면에 그대로 찍힌 발행 시각을 찾는다. 사이트 전체 시각 표기는 건너뛴다."""
+    for match in PLAIN_DATE_TIME.finditer(text):
+        lead = text[max(0, match.start() - 20):match.start()]
+        if any(word in lead for word in SITE_STAMP):
+            continue
         parsed = parse_datetime_text(match.group(0), timezone)
-        if parsed and timedelta(0) <= now - parsed <= timedelta(days=60):
+        if parsed:
+            return parsed
+    return None
+
+
+def _recent_only(parsed: datetime | None, timezone) -> datetime | None:
+    """창간 연도처럼 엉뚱한 날짜를 거른다. 최근 두 달 안쪽만 받아들인다."""
+    if not parsed:
+        return None
+    now = datetime.now(UTC).astimezone(timezone)
+    if timedelta(0) <= now - parsed <= timedelta(days=60):
+        return parsed
+    return None
+
+
+def _recent_date_in_text(text: str, timezone) -> datetime | None:
+    """시각 표기가 아예 없을 때, 지면 위쪽에 적힌 날짜를 마지막으로 찾아본다."""
+    for match in KOREAN_DATE.finditer(text):
+        parsed = _recent_only(parse_datetime_text(match.group(0), timezone), timezone)
+        if parsed:
             return parsed
     return None
 
@@ -350,7 +423,16 @@ def page_metadata(html: str, url: str, timezone) -> dict[str, Any]:
     soup = BeautifulSoup(html or "", "html.parser")
     document_title = clean_html(soup.title.string) if soup.title and soup.title.string else ""
 
-    title = _meta_value(soup, "og:title") or _meta_value(soup, "twitter:title") or document_title
+    # 지역 매체 중에는 <title>에 기사 제목 대신 신문 이름만 적어 두는 곳이 있다.
+    # trafilatura는 그런 지면에서도 본문 머리의 제목을 잘 찾아낸다.
+    extracted = _trafilatura_metadata(html, url)
+
+    title = (
+        _meta_value(soup, "og:title")
+        or _meta_value(soup, "twitter:title")
+        or extracted.get("title", "")
+        or document_title
+    )
     if not title:
         heading = soup.find(["h1", "h2"])
         title = heading.get_text(" ", strip=True) if heading else ""
@@ -358,7 +440,7 @@ def page_metadata(html: str, url: str, timezone) -> dict[str, Any]:
     # 제목 뒤에 "- 매체명"이 따라붙는다. 제목이 너무 짧아지지 않을 때만 떼어 낸다.
     if len(title) > 20:
         title = TITLE_TAIL.split(title)[0].strip() or title
-    title = title.strip(" -–|·>")
+    title = title.strip(" -–|>")
 
     published_at = None
     for key in DATE_META_KEYS:
@@ -373,10 +455,16 @@ def page_metadata(html: str, url: str, timezone) -> dict[str, Any]:
     if not published_at:
         # 시각을 메타 태그에 적지 않는 지역 매체가 많다. 지면에 찍힌 표기를 읽는다.
         text = soup.get_text(" ", strip=True)[:6000]
-        labeled = LABELED_DATE.search(text) or PLAIN_DATE_TIME.search(text)
+        labeled = LABELED_DATE.search(text)
         if labeled:
-            found = labeled.group(1) if labeled.re is LABELED_DATE else labeled.group(0)
-            published_at = parse_datetime_text(found, timezone)
+            published_at = parse_datetime_text(labeled.group(1), timezone)
+        if not published_at:
+            published_at = _plain_datetime_in_text(text, timezone)
+        if not published_at:
+            # trafilatura가 창간일 같은 옛 날짜를 집어 오는 지면도 있다.
+            published_at = _recent_only(
+                parse_datetime_text(extracted.get("date", ""), timezone), timezone
+            )
         if not published_at:
             published_at = _recent_date_in_text(text[:2000], timezone)
 
@@ -410,7 +498,7 @@ async def fetch_linked_article(
     response = await client.get(url)
     response.raise_for_status()
     resolved_url = str(response.url)
-    html = response.text
+    html = decode_html(response)
 
     if is_google_news(resolved_url):
         publisher_url = await resolve_google_news_url(client, html)
@@ -419,7 +507,7 @@ async def fetch_linked_article(
         response = await client.get(publisher_url)
         response.raise_for_status()
         resolved_url = str(response.url)
-        html = response.text
+        html = decode_html(response)
 
     metadata = page_metadata(html, resolved_url, timezone)
     if not metadata["title"]:
@@ -530,14 +618,14 @@ class GoogleNewsRssCollector:
         try:
             response = await client.get(original_url)
             resolved_url = str(response.url)
-            html = response.text if response.is_success else ""
+            html = decode_html(response) if response.is_success else ""
 
             if html and is_google_news(resolved_url):
                 publisher_url = await resolve_google_news_url(client, html)
                 if publisher_url:
                     article_response = await client.get(publisher_url)
                     resolved_url = str(article_response.url)
-                    html = article_response.text if article_response.is_success else ""
+                    html = decode_html(article_response) if article_response.is_success else ""
 
             if html and not is_google_news(resolved_url):
                 article_html = html
@@ -589,6 +677,147 @@ class GoogleNewsRssCollector:
             "preferred": 1 if spec.is_preferred(resolved_url) else 0,
             "duplicate_of": None,
             "images": images,
+        }
+
+
+PHP_SESSION = re.compile(r"[?&]PHPSESSID=[^&]*", re.IGNORECASE)
+# 목록 한 장에서 이만큼까지만 본문을 확인한다. 지역지는 하루 20건 안팎을 낸다.
+LISTING_ARTICLE_LIMIT = 45
+
+
+def listing_article_urls(html: str, listing: SiteListing, base_url: str) -> list[str]:
+    """목록 페이지에서 기사 주소만 골라낸다. 차례는 그대로 둔다."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    found: list[str] = []
+    seen: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
+        if listing.article_mark not in href:
+            continue
+        absolute = PHP_SESSION.sub("", urljoin(base_url, href)).rstrip("?&")
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        found.append(absolute)
+    return found
+
+
+class SiteListingCollector:
+    """지역지 목록 페이지를 직접 읽어 기사를 모은다.
+
+    Google 뉴스는 군산 지역지를 거의 색인하지 않는다. 검색만으로는 정작 필요한
+    기사가 빠지므로, 이 신문들은 지면 목록을 직접 훑는다.
+    """
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    async def collect(
+        self,
+        listings: tuple[SiteListing, ...],
+        spec: SearchSpec,
+        *,
+        job_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, Any]]:
+        # rss_enabled는 '바깥 망에서 수집한다'는 뜻으로 함께 쓴다. 시험에서는 꺼 둔다.
+        if not listings or not spec.keywords or not self.settings.rss_enabled:
+            return []
+
+        headers = {"User-Agent": self.settings.user_agent}
+        timeout = httpx.Timeout(self.settings.request_timeout_seconds)
+        articles: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            headers=headers, timeout=timeout, follow_redirects=True
+        ) as client:
+            for listing in listings:
+                try:
+                    articles += await self._collect_one(client, listing, spec, job_id, start, end)
+                except httpx.HTTPError:
+                    # 한 신문이 응답하지 않아도 나머지 수집은 계속한다.
+                    continue
+        return articles
+
+    async def _collect_one(
+        self,
+        client: httpx.AsyncClient,
+        listing: SiteListing,
+        spec: SearchSpec,
+        job_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, Any]]:
+        response = await client.get(listing.list_url)
+        response.raise_for_status()
+        urls = listing_article_urls(decode_html(response), listing, str(response.url))
+
+        limit = asyncio.Semaphore(4)
+
+        async def one(url: str) -> dict[str, Any] | None:
+            async with limit:
+                return await self._build(client, url, spec, job_id, start, end)
+
+        built = await asyncio.gather(
+            *(one(url) for url in urls[:LISTING_ARTICLE_LIMIT]), return_exceptions=True
+        )
+        return [item for item in built if isinstance(item, dict)]
+
+    async def _build(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        spec: SearchSpec,
+        job_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> dict[str, Any] | None:
+        try:
+            response = await client.get(url)
+            if not response.is_success:
+                return None
+            html = decode_html(response)
+        except httpx.HTTPError:
+            return None
+
+        resolved_url = str(response.url)
+        if not spec.matches_site(resolved_url):
+            return None
+
+        metadata = await asyncio.to_thread(
+            page_metadata, html, resolved_url, self.settings.timezone
+        )
+        published_at = metadata["published_at"]
+        if not metadata["title"] or not published_at:
+            return None
+        if not (start <= published_at < end):
+            return None
+
+        content = await asyncio.to_thread(extract_article_text, html)
+        content = re.sub(r"\n{3,}", "\n\n", strip_ad_lines(content)).strip()
+        matched = match_keywords(spec, f"{metadata['title']} {content[:4000]}")
+        if matched is None:
+            return None
+
+        article_id = hashlib.sha256(f"{job_id}|{resolved_url}".encode("utf-8")).hexdigest()[:32]
+        signature = normalize_text(f"{metadata['title']} {content[:1200]}")
+        return {
+            "id": article_id,
+            "job_id": job_id,
+            "report_date": end.date().isoformat(),
+            "title": metadata["title"],
+            "publisher": metadata["publisher"],
+            "source_url": resolved_url,
+            "published_at": published_at.isoformat(),
+            "scraped_at": datetime.now(UTC).isoformat(),
+            "summary": content[:280],
+            "content": content or metadata["title"],
+            "content_hash": hashlib.sha256(signature.encode("utf-8")).hexdigest(),
+            "matched_keywords": matched,
+            "preferred": 1 if spec.is_preferred(resolved_url) else 0,
+            "manual": 0,
+            "duplicate_of": None,
+            "images": [],
         }
 
 

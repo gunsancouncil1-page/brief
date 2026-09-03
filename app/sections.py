@@ -62,6 +62,7 @@ LOCAL_PRESS: tuple[str, ...] = (
     "newsgunsan.com",              # 군산뉴스
     "gunsanews.com",               # 군산신문
     "gstimes.cyberstreet.co.kr",   # 군산타임즈 · 군산미래신문
+    "kmrnews.com",                 # 군산미래신문
     "todaygunsan.co.kr",           # 투데이군산
     "hansbiz.co.kr",               # 한스경제
     "jjan.kr",                     # 전북일보
@@ -72,12 +73,39 @@ LOCAL_PRESS: tuple[str, ...] = (
 )
 
 
+
+@dataclass(frozen=True)
+class SiteListing:
+    """Google 뉴스가 색인하지 않는 지역지를 직접 훑기 위한 목록 페이지."""
+
+    name: str
+    list_url: str
+    # 목록에서 기사 링크를 골라내는 조각. 주소에 이 문자열이 들어가면 기사로 본다.
+    article_mark: str
+
+
+# 군산 지역지 두 곳은 Google 뉴스에 기사가 거의 올라오지 않는다.
+# 검색에만 기대면 정작 군산시의회 기사를 놓치므로 목록 페이지를 직접 읽는다.
+LOCAL_LISTINGS: tuple[SiteListing, ...] = (
+    SiteListing("군산뉴스", "https://www.newsgunsan.com/ngnews/ngNewsList.php?code=NG2", "ngNewsView.php"),
+    SiteListing("군산미래신문", "https://kmrnews.com:50000/ynews/ynews_list.php?code=NS01", "ynews_view.php"),
+)
+
+
+# 갈래별로 직접 훑을 지면. 검색 결과와 합쳐서 쓴다.
+SECTION_LISTINGS: dict[str, tuple[SiteListing, ...]] = {
+    "council": LOCAL_LISTINGS,
+    "cityhall": LOCAL_LISTINGS,
+}
+
+
 # Google 뉴스가 매체 이름을 주지 않을 때 쓸 이름표.
 # 일부 매체는 www 없는 호스트(ww.newsgunsan.com 등)로도 기사를 낸다.
 PUBLISHER_NAMES: dict[str, str] = {
     "newsgunsan.com": "군산뉴스",
     "gunsanews.com": "군산신문",
     "gstimes.cyberstreet.co.kr": "군산미래신문",
+    "kmrnews.com": "군산미래신문",
     "todaygunsan.co.kr": "투데이군산",
     "hansbiz.co.kr": "한스경제",
     "jjan.kr": "전북일보",
@@ -116,7 +144,7 @@ SECTIONS: dict[str, Section] = {
     "council": Section(
         key="council",
         label="군산시의회",
-        keywords=("군산시의회",),
+        keywords=("군산시의회", "군산시의원"),
         exclude_keywords=(),
         sites=(),
         preferred_sites=LOCAL_PRESS,
@@ -129,7 +157,7 @@ SECTIONS: dict[str, Section] = {
         key="cityhall",
         label="군산시청",
         keywords=("군산시청", "군산시"),
-        exclude_keywords=("군산시의회",),
+        exclude_keywords=("군산시의회", "군산시의원"),
         sites=(),
         preferred_sites=LOCAL_PRESS,
         match_mode="any",

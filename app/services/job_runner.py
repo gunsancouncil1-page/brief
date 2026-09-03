@@ -10,12 +10,13 @@ import httpx
 
 from app.config import Settings
 from app.database import Database
-from app.sections import SECTIONS, review_required
+from app.sections import SECTION_LISTINGS, SECTIONS, review_required
 from app.services.briefing import BriefingService
 from app.services.crawler import (
     DuplicateDetector,
     GoogleNewsRssCollector,
     SearchSpec,
+    SiteListingCollector,
     fetch_linked_article,
 )
 from app.services.publisher import PublishError, publish
@@ -53,6 +54,7 @@ class JobRunner:
         self.database = database
         self.settings = settings
         self.collector = GoogleNewsRssCollector(settings)
+        self.listing_collector = SiteListingCollector(settings)
         self.duplicate_detector = DuplicateDetector()
         self.briefing_service = BriefingService(settings)
         # 시험에서 갈아 끼울 수 있도록 게시 함수를 속성으로 둔다.
@@ -223,6 +225,14 @@ class JobRunner:
             start=start,
             end=end,
             media_dir=self.media_dir(job) if self.settings.images_enabled else None,
+        )
+        # 검색이 닿지 않는 지역지는 지면 목록을 직접 훑어 보탠다.
+        candidates += await self.listing_collector.collect(
+            SECTION_LISTINGS.get(job["section"], ()),
+            spec,
+            job_id=job_id,
+            start=start,
+            end=end,
         )
         for candidate in candidates:
             images = candidate.pop("images", [])

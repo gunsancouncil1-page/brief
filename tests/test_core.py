@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -11,14 +12,17 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.database import Database
 from app.main import create_app
-from app.sections import LOCAL_PRESS, MENU, SECTIONS
+from app.sections import LOCAL_PRESS, MENU, SECTIONS, SiteListing
 from app.security import issue_session, verify_session
 from app.services.briefing import strip_dropped_sections
 from app.services.crawler import (
     DuplicateDetector,
     SearchSpec,
     _google_article_tokens,
+    SiteListingCollector,
+    decode_html,
     is_google_news,
+    listing_article_urls,
     match_keywords,
     page_metadata,
 )
@@ -140,7 +144,7 @@ def test_weekdays_register_themselves(tmp_path: Path):
 
     jobs = {job["section"]: job for job in database.jobs(report_date="2026-08-31")}
     # 갈래 기본 조건이 그대로 들어간다.
-    assert jobs["cityhall"]["exclude_keywords"] == ["군산시의회"]
+    assert jobs["cityhall"]["exclude_keywords"] == ["군산시의회", "군산시의원"]
     assert jobs["broadcast"]["sites"] == list(SECTIONS["broadcast"].sites)
     assert jobs["council"]["preferred_sites"] == list(LOCAL_PRESS)
     # 월요일이므로 금요일 09:00부터다.
@@ -562,7 +566,7 @@ def test_menu_pairs_briefing_tabs_with_their_sections():
         "briefing", "articles", "briefing", "articles", "articles", "articles",
     ]
     assert set(SECTIONS) == {"council", "cityhall", "broadcast", "other_councils"}
-    assert SECTIONS["cityhall"].exclude_keywords == ("군산시의회",)
+    assert SECTIONS["cityhall"].exclude_keywords == ("군산시의회", "군산시의원")
     assert SECTIONS["other_councils"].has_briefing is False
     # 전북특별자치도의회와 도내 13개 시·군의회(군산시의회 제외).
     assert len(SECTIONS["other_councils"].keywords) == 14
@@ -582,7 +586,7 @@ def test_section_registration_and_report_endpoints(tmp_path: Path):
 
         # 갈래별 기본 검색 조건이 그대로 적용된다.
         jobs = {job["section"]: job for job in client.get("/api/admin/jobs").json()["jobs"]}
-        assert jobs["cityhall"]["exclude_keywords"] == ["군산시의회"]
+        assert jobs["cityhall"]["exclude_keywords"] == ["군산시의회", "군산시의원"]
         assert jobs["other_councils"]["generate_briefing"] is False
         assert jobs["council"]["generate_briefing"] is True
 
@@ -1285,3 +1289,154 @@ def test_previous_dates_are_kept_when_purging_is_off(tmp_path: Path, monkeypatch
 
         assert "purged_dates" not in result
         assert Database(settings.database_path).dates() == ["2026-08-26", "2026-08-25"]
+
+
+def test_euc_kr_pages_are_read_with_their_own_encoding():
+    """지역 매체 상당수가 EUC-KR을 쓰고 charset을 <meta>에만 적어 둔다."""
+    page = (
+        "<html><head><title>군산뉴스</title>"
+        '<meta http-equiv="content-type" content="text/html; charset=euc-kr"></head>'
+        "<body><p>군산시의회는 2일 의원총회를 열었다.</p></body></html>"
+    )
+    response = httpx.Response(
+        200, content=page.encode("cp949"), headers={"content-type": "text/html"}
+    )
+    # 헤더에 charset이 없으면 httpx는 UTF-8로 넘겨짚어 글자가 깨진다.
+    assert "�" in response.text
+    assert "군산시의회는 2일 의원총회를 열었다." in decode_html(response)
+
+    # charset을 제대로 알려 주는 지면은 그대로 읽는다.
+    utf8 = httpx.Response(
+        200,
+        content="<html><body>군산시청</body></html>".encode("utf-8"),
+        headers={"content-type": "text/html; charset=utf-8"},
+    )
+    assert "군산시청" in decode_html(utf8)
+
+
+def test_site_wide_timestamp_is_not_mistaken_for_the_article_time():
+    """지면 위쪽의 '최종업데이트' 시각이 아니라 기사에 찍힌 시각을 읽는다."""
+    seoul = ZoneInfo("Asia/Seoul")
+    now = datetime.now(UTC).astimezone(seoul)
+    banner = now.strftime("%Y년 %m월 %d일(%a) %H:%M")
+    written = (now - timedelta(days=1)).replace(hour=14, minute=13)
+    html = f"""<html><head><title>서은식 시의원, “도심 개발 불균형 해소하자”</title></head>
+    <body><span>최종업데이트 {banner}</span>
+    <p>한정근 기자 / {written.strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <p>군산시의회가 도심 개발 불균형 해소를 촉구했다.</p></body></html>"""
+
+    meta = page_metadata(html, "https://kmrnews.com:50000/ynews/ynews_view.php?pid=1", seoul)
+    assert meta["publisher"] == "군산미래신문"
+    assert meta["published_at"].strftime("%Y-%m-%d %H:%M") == written.strftime("%Y-%m-%d %H:%M")
+
+
+def test_title_falls_back_when_the_page_title_is_only_the_paper_name():
+    """<title>에 신문 이름만 있는 지면에서도 기사 제목을 찾아낸다."""
+    seoul = ZoneInfo("Asia/Seoul")
+    html = """<html><head><title>군산뉴스</title></head>
+    <body><div id="article">
+    <h1>군산시의회, 올해 공무국외연수 ‘안 간다’</h1>
+    <p>군산시의회는 2일 의원총회를 열고 올해 의원 공무국외연수를 실시하지 않기로 뜻을 모았다.
+    연수 예산은 반납해 민생 분야에 활용하는 방안도 함께 추진한다.</p>
+    </div></body></html>"""
+    meta = page_metadata(html, "https://www.newsgunsan.com/ngnews/ngNewsView.php?pid=1", seoul)
+    assert meta["title"] == "군산시의회, 올해 공무국외연수 ‘안 간다’"
+    assert meta["publisher"] == "군산뉴스"
+
+
+LISTING_PAGE = """
+<html><head><meta http-equiv="content-type" content="text/html; charset=euc-kr"></head>
+<body>
+  <a href="ngNewsView.php?code=NG2&pid=1&PHPSESSID=abc">군산시의회, 공무국외연수 취소</a>
+  <a href="ngNewsView.php?code=NG2&pid=1&PHPSESSID=abc">사진</a>
+  <a href="ngNewsView.php?code=NG2&pid=2&PHPSESSID=abc">군산 배추값 강세</a>
+  <a href="ngNewsList.php?code=NG2">목록</a>
+</body></html>
+"""
+
+
+def _listing_article(title: str, body: str, when) -> str:
+    return f"""<html><head><title>군산뉴스</title>
+    <meta http-equiv="content-type" content="text/html; charset=euc-kr"></head>
+    <body><h1>{title}</h1><span>{when.strftime('%Y-%m-%d %H:%M')}</span>
+    <p>{body}</p></body></html>"""
+
+
+def test_local_papers_are_read_from_their_own_listing_pages(tmp_path: Path):
+    """Google 뉴스가 색인하지 않는 지역지는 지면 목록을 직접 훑는다."""
+    seoul = ZoneInfo("Asia/Seoul")
+    start = datetime(2026, 9, 2, 9, 0, tzinfo=seoul)
+    end = datetime(2026, 9, 3, 5, 0, tzinfo=seoul)
+    inside = datetime(2026, 9, 2, 19, 20, tzinfo=seoul)
+    outside = datetime(2026, 9, 1, 8, 0, tzinfo=seoul)
+
+    pages = {
+        "https://www.newsgunsan.com/ngnews/ngNewsList.php?code=NG2": LISTING_PAGE,
+        "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=1": _listing_article(
+            "군산시의회, 올해 공무국외연수 ‘안 간다’",
+            "군산시의회는 2일 의원총회를 열고 공무국외연수를 하지 않기로 했다.",
+            inside,
+        ),
+        # 키워드에 걸리지 않는 기사와 시간창 밖의 기사는 담지 않는다.
+        "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=2": _listing_article(
+            "군산 배추값 강세", "이달 들어 배추 도매가가 올랐다.", outside
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = pages.get(str(request.url))
+        if page is None:
+            return httpx.Response(404)
+        return httpx.Response(
+            200, content=page.encode("cp949"), headers={"content-type": "text/html"}
+        )
+
+    settings = make_settings(tmp_path)
+    settings = replace(settings, rss_enabled=True)
+    collector = SiteListingCollector(settings)
+    listing = SiteListing(
+        "군산뉴스", "https://www.newsgunsan.com/ngnews/ngNewsList.php?code=NG2", "ngNewsView.php"
+    )
+    spec = SearchSpec(keywords=("군산시의회",), preferred_sites=LOCAL_PRESS)
+
+    original = httpx.AsyncClient
+
+    def factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original(**kwargs)
+
+    articles = asyncio.run(
+        _with_client(factory, collector, (listing,), spec, start=start, end=end)
+    )
+    assert len(articles) == 1
+    article = articles[0]
+    assert article["title"] == "군산시의회, 올해 공무국외연수 ‘안 간다’"
+    assert article["publisher"] == "군산뉴스"
+    assert article["published_at"] == inside.isoformat()
+    # 목록의 PHPSESSID는 떼고 저장한다. 같은 기사가 매번 새 주소로 쌓이면 안 된다.
+    assert "PHPSESSID" not in article["source_url"]
+    assert article["preferred"] == 1 and article["manual"] == 0
+
+
+async def _with_client(factory, collector, listings, spec, *, start, end):
+    import app.services.crawler as crawler
+
+    original = crawler.httpx.AsyncClient
+    crawler.httpx.AsyncClient = factory
+    try:
+        return await collector.collect(listings, spec, job_id="job-1", start=start, end=end)
+    finally:
+        crawler.httpx.AsyncClient = original
+
+
+def test_listing_links_are_deduplicated_and_made_absolute():
+    listing = SiteListing(
+        "군산뉴스", "https://www.newsgunsan.com/ngnews/ngNewsList.php?code=NG2", "ngNewsView.php"
+    )
+    urls = listing_article_urls(
+        LISTING_PAGE, listing, "https://www.newsgunsan.com/ngnews/ngNewsList.php?code=NG2"
+    )
+    assert urls == [
+        "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=1",
+        "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=2",
+    ]
