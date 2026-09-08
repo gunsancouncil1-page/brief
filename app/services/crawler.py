@@ -22,7 +22,7 @@ from rapidfuzz import fuzz
 
 from app.config import Settings
 from app.database import Database
-from app.sections import SiteListing, publisher_for
+from app.sections import SiteListing, is_excluded_url, publisher_for
 from app.services.images import collect_article_images
 
 
@@ -419,6 +419,18 @@ def _recent_date_in_text(text: str, timezone) -> datetime | None:
     return None
 
 
+def is_article_title(title: str, publisher: str) -> bool:
+    """기사 제목처럼 보이는지.
+
+    게시판이나 목록 지면을 잘못 집으면 제목 자리에 신문 이름만 남는다.
+    그런 것은 보도자료가 아니므로 수집하지 않는다.
+    """
+    cleaned = (title or "").strip()
+    if len(cleaned) < 8:
+        return False
+    return normalize_text(cleaned) != normalize_text(publisher or "")
+
+
 def _longest_heading(soup: BeautifulSoup) -> str:
     """지면에서 기사 제목으로 보이는 가장 긴 머리글."""
     best = ""
@@ -707,7 +719,7 @@ def listing_article_urls(html: str, listing: SiteListing, base_url: str) -> list
     seen: set[str] = set()
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"]
-        if listing.article_mark not in href:
+        if listing.article_mark not in href or is_excluded_url(href):
             continue
         absolute = PHP_SESSION.sub("", urljoin(base_url, href)).rstrip("?&")
         if absolute in seen:
@@ -810,14 +822,14 @@ class SiteListingCollector:
             return None
 
         resolved_url = str(response.url)
-        if not spec.matches_site(resolved_url):
+        if not spec.matches_site(resolved_url) or is_excluded_url(resolved_url):
             return None
 
         metadata = await asyncio.to_thread(
             page_metadata, html, resolved_url, self.settings.timezone
         )
         published_at = metadata["published_at"]
-        if not metadata["title"] or not published_at:
+        if not published_at or not is_article_title(metadata["title"], metadata["publisher"]):
             return None
         if not (start <= published_at < end):
             return None

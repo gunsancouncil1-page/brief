@@ -112,6 +112,20 @@ SECTION_LISTINGS: dict[str, tuple[SiteListing, ...]] = {
 }
 
 
+
+# 기사가 아닌 지면. 군산뉴스는 공지사항·알림을 게시판(/ngboard/)에 올리는데,
+# 기사 링크가 그리로 넘어가는 경우가 있다. 업무협약식 안내 같은 공지는
+# 보도자료가 아니므로 수집에서 뺀다.
+EXCLUDED_URL_PARTS: tuple[str, ...] = (
+    "/ngboard/",
+)
+
+
+def is_excluded_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(part in lowered for part in EXCLUDED_URL_PARTS)
+
+
 # Google 뉴스가 매체 이름을 주지 않을 때 쓸 이름표.
 # 일부 매체는 www 없는 호스트(ww.newsgunsan.com 등)로도 기사를 낸다.
 PUBLISHER_NAMES: dict[str, str] = {

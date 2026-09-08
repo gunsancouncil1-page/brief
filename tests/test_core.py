@@ -12,7 +12,15 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.database import Database
 from app.main import create_app
-from app.sections import LOCAL_PRESS, MENU, SECTION_LISTINGS, SECTIONS, SiteListing
+from app.sections import (
+    LOCAL_LISTINGS,
+    LOCAL_PRESS,
+    MENU,
+    SECTION_LISTINGS,
+    SECTIONS,
+    SiteListing,
+    is_excluded_url,
+)
 from app.security import issue_session, verify_session
 from app.services.briefing import (
     CONTEXT_BUDGET,
@@ -28,6 +36,7 @@ from app.services.crawler import (
     _google_article_tokens,
     SiteListingCollector,
     decode_html,
+    is_article_title,
     is_google_news,
     listing_article_urls,
     match_keywords,
@@ -1501,3 +1510,58 @@ def test_briefing_adds_back_articles_the_model_skipped():
     assert completed.endswith("- 제목4 (군산뉴스) [기사 4]")
     # 이미 다 인용했으면 그대로 둔다.
     assert append_uncited(body, articles[:3]) == body
+
+
+def test_notice_board_pages_are_never_scraped(tmp_path: Path):
+    """군산뉴스 공지사항(/ngboard/)은 보도자료가 아니므로 담지 않는다."""
+    notice = (
+        "https://newsgunsan.com/ngboard/read.php?table=news&oid=3474&r_page=45"
+        "&PHPSESSID=34066715e48c1564ac0a73a57dbefae8"
+    )
+    article = "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=90443"
+    assert is_excluded_url(notice)
+    assert not is_excluded_url(article)
+
+    # 제목 자리에 신문 이름만 남는 지면도 기사가 아니다.
+    assert not is_article_title("군산뉴스", "군산뉴스")
+    assert not is_article_title("공지", "군산뉴스")
+    assert is_article_title("군산시의회, 올해 공무국외연수 ‘안 간다’", "군산뉴스")
+
+    # 기사 링크가 게시판으로 넘어가면 그 시점에 버린다.
+    seoul = ZoneInfo("Asia/Seoul")
+    start = datetime(2026, 9, 7, 9, 0, tzinfo=seoul)
+    end = datetime(2026, 9, 8, 5, 0, tzinfo=seoul)
+    listing_page = f'<html><body><a href="{article}">기사</a></body></html>'
+    board_page = """<html><head><title>군산뉴스</title></head>
+    <body><h1>군산뉴스</h1><p>2024 불가사리 구제사업 자원재활용을 위한 업무협약식 안내입니다.
+    군산시와 관계 기관이 참석합니다.</p><span>2026-09-07 14:22</span></body></html>"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "ngNewsList.php" in url:
+            return httpx.Response(200, html=listing_page)
+        if "ngNewsView.php" in url:
+            # 실제 지면처럼 게시판으로 넘긴다.
+            return httpx.Response(302, headers={"location": notice})
+        return httpx.Response(200, html=board_page)
+
+    settings = replace(make_settings(tmp_path), rss_enabled=True)
+    collector = SiteListingCollector(settings)
+    spec = SearchSpec(keywords=("군산시",), preferred_sites=LOCAL_PRESS)
+    found = asyncio.run(
+        _with_client(
+            _mock_client_factory(handler), collector, (LOCAL_LISTINGS[0],), spec,
+            start=start, end=end,
+        )
+    )
+    assert found == []
+
+
+def _mock_client_factory(handler):
+    original = httpx.AsyncClient
+
+    def factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original(**kwargs)
+
+    return factory
