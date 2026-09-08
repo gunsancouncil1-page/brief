@@ -62,3 +62,7 @@ Set-Location -LiteralPath $ProjectRoot
 # 'Stop'인 채로 두면 첫 기록 줄에서 서버가 그대로 죽는다.
 $ErrorActionPreference = 'Continue'
 & $Python -m uvicorn app.main:app --host $resolvedHost --port $resolvedPort
+
+# 서버가 죽은 이유를 그대로 물려준다. 0으로 끝내면 작업 스케줄러가 성공으로
+# 보고 다시 띄우지 않는다(포트 충돌로 죽어도 그대로 방치된다).
+exit $LASTEXITCODE
