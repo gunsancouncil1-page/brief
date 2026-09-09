@@ -22,7 +22,7 @@ from rapidfuzz import fuzz
 
 from app.config import Settings
 from app.database import Database
-from app.sections import SiteListing, is_excluded_url, publisher_for
+from app.sections import SiteListing, is_excluded_title, is_excluded_url, publisher_for
 from app.services.images import collect_article_images
 
 
@@ -426,7 +426,7 @@ def is_article_title(title: str, publisher: str) -> bool:
     그런 것은 보도자료가 아니므로 수집하지 않는다.
     """
     cleaned = (title or "").strip()
-    if len(cleaned) < 8:
+    if len(cleaned) < 8 or is_excluded_title(cleaned):
         return False
     return normalize_text(cleaned) != normalize_text(publisher or "")
 
@@ -668,6 +668,11 @@ class GoogleNewsRssCollector:
         if not spec.matches_site(resolved_url):
             return None
 
+        # 게시판·검색 결과처럼 기사가 아닌 지면은 검색 색인에도 올라온다.
+        publisher = publisher_for(resolved_url) or source_name(entry)
+        if is_excluded_url(resolved_url) or not is_article_title(title, publisher):
+            return None
+
         content = re.sub(r"\n{3,}", "\n\n", strip_ad_lines(content)).strip()
         matched = match_keywords(spec, f"{title} {summary} {content[:4000]}")
         if matched is None:
@@ -693,7 +698,7 @@ class GoogleNewsRssCollector:
             "report_date": end.date().isoformat(),
             "title": title,
             # RSS가 이름 대신 호스트만 줄 때가 있다. 아는 매체면 제 이름으로 적는다.
-            "publisher": publisher_for(resolved_url) or source_name(entry),
+            "publisher": publisher,
             "source_url": resolved_url,
             "published_at": published_at.isoformat(),
             "scraped_at": datetime.now(UTC).isoformat(),

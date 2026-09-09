@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -16,6 +17,9 @@ HEADING_MARK = re.compile(r"^#{1,6}\s*")
 CONTEXT_BUDGET = 24000
 MAX_ARTICLES = 60
 MODEL_CONTEXT = 32768
+# PC를 막 켰을 때는 Ollama가 아직 준비되지 않아 연결이 거절된다.
+CONNECT_ATTEMPTS = 3
+CONNECT_RETRY_SECONDS = 20
 # 모델이 지시를 어기고 붙이는 경우가 있어, 저장 전에 한 번 더 걷어낸다.
 DROPPED_SECTION = re.compile(r"^#{1,6}\s*(확인\s*필요|확인이\s*필요한\s*점|추가\s*확인)", re.IGNORECASE)
 
@@ -146,25 +150,39 @@ class BriefingService:
             ],
             "options": {"temperature": 0.2, "num_ctx": MODEL_CONTEXT},
         }
-        try:
-            async with httpx.AsyncClient(timeout=self.settings.ollama_timeout_seconds) as client:
-                response = await client.post(f"{self.settings.ollama_url}/api/chat", json=payload)
-                response.raise_for_status()
-                result = response.json()
-            body = strip_dropped_sections((result.get("message") or {}).get("content", ""))
-            if not body:
-                raise ValueError("Ollama returned an empty message")
-            body = append_uncited(body, articles)
-            return {
-                "body": body,
-                "status": "complete",
-                "model": self.settings.ollama_model,
-                "generated_at": generated_at,
-            }
-        except (httpx.HTTPError, ValueError, KeyError) as error:
-            return {
-                "body": self._fallback(job, articles, type(error).__name__),
-                "status": "fallback",
-                "model": self.settings.ollama_model,
-                "generated_at": generated_at,
-            }
+        last_error: Exception | None = None
+        for attempt in range(CONNECT_ATTEMPTS):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self.settings.ollama_timeout_seconds
+                ) as client:
+                    response = await client.post(
+                        f"{self.settings.ollama_url}/api/chat", json=payload
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                body = strip_dropped_sections((result.get("message") or {}).get("content", ""))
+                if not body:
+                    raise ValueError("Ollama returned an empty message")
+                body = append_uncited(body, articles)
+                return {
+                    "body": body,
+                    "status": "complete",
+                    "model": self.settings.ollama_model,
+                    "generated_at": datetime.now(UTC).isoformat(),
+                }
+            except httpx.ConnectError as error:
+                # PC를 켠 직후에는 Ollama가 아직 뜨지 않았을 수 있다. 조금 기다려 본다.
+                last_error = error
+                if attempt + 1 < CONNECT_ATTEMPTS:
+                    await asyncio.sleep(CONNECT_RETRY_SECONDS)
+            except (httpx.HTTPError, ValueError, KeyError) as error:
+                last_error = error
+                break
+
+        return {
+            "body": self._fallback(job, articles, type(last_error).__name__),
+            "status": "fallback",
+            "model": self.settings.ollama_model,
+            "generated_at": generated_at,
+        }

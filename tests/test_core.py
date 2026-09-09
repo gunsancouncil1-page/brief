@@ -35,6 +35,7 @@ from app.services.crawler import (
     SearchSpec,
     _google_article_tokens,
     SiteListingCollector,
+    GoogleNewsRssCollector,
     decode_html,
     is_article_title,
     is_google_news,
@@ -1565,3 +1566,90 @@ def _mock_client_factory(handler):
         return original(**kwargs)
 
     return factory
+
+
+def test_search_and_board_pages_are_rejected_on_every_path():
+    """게시판·검색 결과 지면은 검색 색인으로 들어와도 걸러낸다."""
+    excluded = [
+        "https://newsgunsan.com/ngboard/read.php?table=news&oid=3175&r_page=70",
+        "https://news.kbs.co.kr/news/mobile/Search/Search.do?query=%EA%B5%B0%EC%82%B0&page=1",
+    ]
+    kept = [
+        "https://news.kbs.co.kr/news/pc/view/view.do?ncd=8653860",
+        "https://www.jtv.co.kr/news/article.php?id=70920",
+        "https://kcn.tv/?r=home&c=1/2&uid=4925615",
+        "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=90443",
+        "https://kmrnews.com:50000/ynews/ynews_view.php?code=NS01&pid=90068",
+        "https://www.jmbc.co.kr/news/view/67624",
+    ]
+    assert all(is_excluded_url(url) for url in excluded)
+    assert not any(is_excluded_url(url) for url in kept)
+
+    # 검색 결과 지면은 제목에서도 드러난다(광고글이 심긴 주소가 색인되기도 한다).
+    assert not is_article_title("검색 결과 > /군산캔디파는곳🥳Ky7979🌈대구떨액팝니다", "KBS 뉴스")
+    assert is_article_title("군산해경, 기관장 없이 조업한 어선 적발", "KBS 뉴스")
+
+
+def test_rss_results_skip_pages_that_are_not_articles(tmp_path: Path):
+    """검색으로 찾은 결과도 기사 지면인지 확인한 뒤에 담는다."""
+    seoul = ZoneInfo("Asia/Seoul")
+    start = datetime(2026, 9, 8, 9, 0, tzinfo=seoul)
+    end = datetime(2026, 9, 9, 5, 0, tzinfo=seoul)
+    published = datetime(2026, 9, 8, 17, 27, tzinfo=seoul)
+
+    board = "https://newsgunsan.com/ngboard/read.php?table=news&oid=3175"
+    entry = {
+        "link": board,
+        "title": "군산뉴스",
+        "summary": "군산시 관련 공지",
+        "published": published.strftime("%a, %d %b %Y %H:%M:%S +0900"),
+        "source": {"title": "군산뉴스"},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html="<html><body><p>군산시 공지사항입니다.</p></body></html>")
+
+    collector = GoogleNewsRssCollector(replace(make_settings(tmp_path), rss_enabled=True))
+    spec = SearchSpec(keywords=("군산시",), preferred_sites=LOCAL_PRESS)
+
+    async def build():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await collector._build_article(client, entry, spec, "job-1", start, end, None)
+
+    assert asyncio.run(build()) is None
+
+
+def test_fallback_briefings_are_rebuilt_when_the_model_comes_back(tmp_path: Path):
+    """LLM이 없어 대체본으로 남은 브리핑은 나중에 다시 만든다."""
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database, section="cityhall", name="군산시청", generate_briefing=True)
+    database.upsert_article(
+        sample_article(job["id"], "c0", "https://www.jjan.kr/1", "전북일보", DISTINCT_BODIES[0])
+    )
+    database.set_approved(job["id"], True)
+    database.save_briefing(
+        job["id"],
+        body="# 군산시청 수집 현황\n사유: ConnectError",
+        status="fallback",
+        model="test-model",
+        generated_at="2026-08-25T05:00:00+00:00",
+    )
+
+    runner = JobRunner(database, settings)
+
+    async def fake_create(job_row, articles):
+        return {
+            "body": "# 한눈에 보기\n군산시 소식 [기사 1]",
+            "status": "complete",
+            "model": "test-model",
+            "generated_at": "2026-08-25T06:00:00+00:00",
+        }
+
+    runner.briefing_service.create = fake_create
+    assert asyncio.run(runner.refresh_fallback_briefings()) == ["cityhall"]
+    assert database.get_briefing(job["id"])["status"] == "complete"
+
+    # 이미 정상인 브리핑은 다시 만들지 않는다.
+    assert asyncio.run(runner.refresh_fallback_briefings()) == []

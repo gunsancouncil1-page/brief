@@ -113,17 +113,32 @@ SECTION_LISTINGS: dict[str, tuple[SiteListing, ...]] = {
 
 
 
-# 기사가 아닌 지면. 군산뉴스는 공지사항·알림을 게시판(/ngboard/)에 올리는데,
-# 기사 링크가 그리로 넘어가는 경우가 있다. 업무협약식 안내 같은 공지는
-# 보도자료가 아니므로 수집에서 뺀다.
+# 기사가 아닌 지면. 검색 색인에는 이런 주소도 함께 올라온다.
+#  - 군산뉴스는 공지사항·알림을 게시판(/ngboard/)에 올리는데 기사 링크가 그리로 넘어간다.
+#  - 언론사 검색 결과 지면은 광고글을 심어 둔 주소가 그대로 색인되기도 한다.
 EXCLUDED_URL_PARTS: tuple[str, ...] = (
     "/ngboard/",
+    "/search/",
+    "search.do",
+    "query=",
+)
+
+
+# 목록·검색 지면은 제목부터 기사가 아니다.
+EXCLUDED_TITLE_MARKS: tuple[str, ...] = (
+    "검색 결과",
+    "검색결과",
 )
 
 
 def is_excluded_url(url: str) -> bool:
     lowered = (url or "").lower()
     return any(part in lowered for part in EXCLUDED_URL_PARTS)
+
+
+def is_excluded_title(title: str) -> bool:
+    stripped = (title or "").strip()
+    return any(stripped.startswith(mark) for mark in EXCLUDED_TITLE_MARKS)
 
 
 # Google 뉴스가 매체 이름을 주지 않을 때 쓸 이름표.

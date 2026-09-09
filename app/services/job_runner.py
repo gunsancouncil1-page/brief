@@ -164,10 +164,35 @@ class JobRunner:
                 # stopping here.
                 results.append({"job_id": job["id"], "status": "skipped", "error": str(error)})
         batch = {"ran_at": moment.isoformat(), "job_count": len(results), "jobs": results}
+        rebuilt = await self.refresh_fallback_briefings()
+        if rebuilt:
+            batch["rebuilt_briefings"] = rebuilt
         # 자동 승인된 갈래가 하나라도 있으면 사이트를 한 번만 올린다.
-        if any(item.get("approved") for item in results):
+        if rebuilt or any(item.get("approved") for item in results):
             batch["publish"] = await self.publish_site()
         return batch
+
+    async def refresh_fallback_briefings(self) -> list[str]:
+        """LLM을 못 만나 확인 목록으로 대체됐던 브리핑을 다시 만든다.
+
+        새벽 5시에는 Ollama가 아직 떠 있지 않을 수 있다. 그때 대체본으로 남은
+        브리핑을, 나중에 준비된 뒤에 조용히 되살린다.
+        """
+        rebuilt: list[str] = []
+        for job in self.database.jobs():
+            if not job["generate_briefing"] or not job["approved_at"]:
+                continue
+            briefing = self.database.get_briefing(job["id"])
+            if not briefing or briefing["status"] != "fallback":
+                continue
+            articles = self.database.articles(
+                job["id"], unique_only=True, include_excluded=False
+            )
+            result = await self.briefing_service.create(job, articles)
+            self.database.save_briefing(job["id"], **result)
+            if result["status"] == "complete":
+                rebuilt.append(job["section"])
+        return rebuilt
 
     async def run_job(self, job_id: str, *, publish_after: bool = True) -> dict[str, Any]:
         job = self.database.get_job(job_id)
