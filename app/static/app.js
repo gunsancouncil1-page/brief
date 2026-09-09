@@ -161,19 +161,20 @@ function showSkeleton() {
     </div>`;
 }
 
-function showEmpty(title, message) {
-  contentEl.innerHTML = `<div class="empty"><p class="empty-title">${escapeHtml(title)}</p><p>${escapeHtml(message)}</p></div>`;
+// 보도자료가 없을 때 공개 화면에 보이는 문구.
+const EMPTY_MESSAGE = "오늘 일자 보도자료는 없습니다.";
+
+function showEmpty(title, message = "") {
+  // 덧붙일 설명이 없으면 한 줄만 보여 준다.
+  const detail = message ? `<p>${escapeHtml(message)}</p>` : "";
+  contentEl.innerHTML = `<div class="empty"><p class="empty-title">${escapeHtml(title)}</p>${detail}</div>`;
   contentEl.classList.add("fade-in");
 }
 
 /* ── Articles ─────────────────────────────────────────────── */
 function renderArticles(articles) {
   if (!articles.length) {
-    const tab = currentTab();
-    showEmpty(
-      "보도자료가 없습니다",
-      `${state.reportDate} 수집 시간창에는 ${tab ? tab.label : "해당 메뉴의"} 보도자료가 없습니다.`,
-    );
+    showEmpty(EMPTY_MESSAGE);
     return;
   }
   // 관리자가 정한 차례를 그대로 보여 준다(서버가 그 순서로 내려 준다).
@@ -244,11 +245,11 @@ async function render() {
   renderNote(job);
 
   if (!state.reportDate) {
-    showEmpty("수집된 자료가 없습니다", "관리자 페이지에서 기준일을 등록하면 이곳에 표시됩니다.");
+    showEmpty(EMPTY_MESSAGE);
     return;
   }
   if (!job) {
-    showEmpty("이 날짜에 등록된 수집이 없습니다", `관리자 페이지에서 '${tab.label}' 수집을 등록하세요.`);
+    showEmpty(EMPTY_MESSAGE);
     return;
   }
   if (!job.approved) {
@@ -279,7 +280,7 @@ async function render() {
     }
   } catch (error) {
     if (error.status === 404) {
-      showEmpty("아직 준비되지 않았습니다", error.message);
+      showEmpty(EMPTY_MESSAGE);
       return;
     }
     contentEl.innerHTML = `<p class="error-block">${escapeHtml(error.message)}</p>`;
