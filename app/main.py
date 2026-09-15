@@ -143,8 +143,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         if settings.auto_register:
             # 05:00에 PC가 꺼져 있었더라도, 켜는 시점에 그날 몫을 채우고 이어서 돌린다.
-            runner.ensure_registered(datetime.now(settings.timezone).date())
-            asyncio.get_running_loop().create_task(runner.run_due_jobs())
+            # 등록이 어긋나더라도 서버까지 함께 죽어서는 안 된다. 화면과 관리자
+            # 페이지는 열려 있어야 관리자가 상황을 볼 수 있다.
+            try:
+                runner.ensure_registered(datetime.now(settings.timezone).date())
+                asyncio.get_running_loop().create_task(runner.run_due_jobs())
+            except Exception:  # noqa: BLE001 - 기록만 남기고 계속 뜬다
+                logging.getLogger("uvicorn.error").exception("자동 등록에 실패했습니다.")
         scheduler: AsyncIOScheduler | None = None
         if settings.schedule_enabled:
             scheduler = AsyncIOScheduler(timezone=settings.timezone)

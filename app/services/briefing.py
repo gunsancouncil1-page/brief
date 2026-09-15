@@ -20,6 +20,9 @@ MODEL_CONTEXT = 32768
 # PC를 막 켰을 때는 Ollama가 아직 준비되지 않아 연결이 거절된다.
 CONNECT_ATTEMPTS = 3
 CONNECT_RETRY_SECONDS = 20
+# 그날 실을 기사가 없을 때 브리핑 탭에 그대로 실리는 문구.
+# 다른 탭의 빈 화면 문구와 같은 문장을 쓴다.
+EMPTY_BRIEFING = "오늘 일자 보도자료는 없습니다."
 # 모델이 지시를 어기고 붙이는 경우가 있어, 저장 전에 한 번 더 걷어낸다.
 DROPPED_SECTION = re.compile(r"^#{1,6}\s*(확인\s*필요|확인이\s*필요한\s*점|추가\s*확인)", re.IGNORECASE)
 
@@ -115,7 +118,7 @@ class BriefingService:
         generated_at = datetime.now(UTC).isoformat()
         if not articles:
             return {
-                "body": "# 수집 결과\n\n해당 시간창에서 중복 제거 후 남은 보도자료가 없습니다.",
+                "body": EMPTY_BRIEFING,
                 "status": "complete",
                 "model": self.settings.ollama_model,
                 "generated_at": generated_at,

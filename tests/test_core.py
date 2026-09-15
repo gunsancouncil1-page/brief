@@ -1653,3 +1653,13 @@ def test_fallback_briefings_are_rebuilt_when_the_model_comes_back(tmp_path: Path
 
     # 이미 정상인 브리핑은 다시 만들지 않는다.
     assert asyncio.run(runner.refresh_fallback_briefings()) == []
+
+
+def test_empty_day_briefing_uses_the_same_sentence_as_the_other_tabs():
+    """실을 기사가 없는 날은 브리핑 탭도 같은 한 문장을 보여 준다."""
+    job = {"name": "군산시의회", "keywords": ["군산시의회"], "report_date": "2026-09-16"}
+    result = asyncio.run(BriefingService(make_settings(Path("."))).create(job, []))
+    assert result["body"] == "오늘 일자 보도자료는 없습니다."
+    assert result["status"] == "complete"
+    # 안내 문구만 남기고 제목 줄은 붙이지 않는다.
+    assert "#" not in result["body"]

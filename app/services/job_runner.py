@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import sqlite3
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ import httpx
 
 from app.config import Settings
 from app.database import Database
-from app.sections import SECTION_LISTINGS, SECTIONS, review_required
+from app.sections import SECTION_LISTINGS, SECTIONS, Section, review_required
 from app.services.briefing import BriefingService
 from app.services.crawler import (
     DuplicateDetector,
@@ -121,21 +122,31 @@ class JobRunner:
         for section in SECTIONS.values():
             if self.database.job_for_section(report_date.isoformat(), section.key):
                 continue
-            self.database.create_job(
-                report_date=report_date.isoformat(),
-                section=section.key,
-                name=section.label,
-                keywords=list(section.keywords),
-                exclude_keywords=list(section.exclude_keywords),
-                sites=list(section.sites),
-                preferred_sites=list(section.preferred_sites),
-                match_mode=section.match_mode,
-                generate_briefing=section.has_briefing,
-                window_start=start.isoformat(),
-                window_end=end.isoformat(),
-            )
+            try:
+                self._register_section(section, report_date, start, end)
+            except sqlite3.IntegrityError:
+                # 서버가 두 번 떠서 같은 순간에 등록을 시도할 수 있다.
+                # 먼저 넣은 쪽이 이겼을 뿐이므로 조용히 넘어간다.
+                continue
             created.append(section.key)
         return created
+
+    def _register_section(
+        self, section: Section, report_date: date, start: datetime, end: datetime
+    ) -> None:
+        self.database.create_job(
+            report_date=report_date.isoformat(),
+            section=section.key,
+            name=section.label,
+            keywords=list(section.keywords),
+            exclude_keywords=list(section.exclude_keywords),
+            sites=list(section.sites),
+            preferred_sites=list(section.preferred_sites),
+            match_mode=section.match_mode,
+            generate_briefing=section.has_briefing,
+            window_start=start.isoformat(),
+            window_end=end.isoformat(),
+        )
 
     async def collect_today(self, now: datetime | None = None) -> dict[str, Any]:
         """05:00 스케줄러가 부르는 일과. 등록을 채운 뒤 밀린 수집까지 처리한다."""
