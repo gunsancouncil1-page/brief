@@ -216,32 +216,125 @@ a { color: inherit; }
   background: var(--ink);
 }
 
-/* 지난 날짜를 고르는 목록. 선택된 날짜 칩과 같은 모양으로 보이게 한다. */
-.date-select {
-  appearance: none;
-  -webkit-appearance: none;
-  padding: 7px 34px 7px 14px;
+/* 지난 날짜를 고르는 달력. 누르는 자리는 선택된 날짜 칩과 같은 모양이다. */
+.date-picker { position: relative; }
+
+.date-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 15px 7px 13px;
   border: 1px solid transparent;
   border-radius: 999px;
   color: #fff;
-  background-color: var(--ink);
-  /* 아래쪽 화살표. 글자색과 같은 흰색으로 그린다. */
-  background-image:
-    linear-gradient(45deg, transparent 50%, #fff 50%),
-    linear-gradient(135deg, #fff 50%, transparent 50%);
-  background-position: calc(100% - 17px) 50%, calc(100% - 12px) 50%;
-  background-size: 5px 5px, 5px 5px;
-  background-repeat: no-repeat;
+  background: var(--ink);
   font-size: .8rem;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
+  transition: background .18s ease;
 }
 
-.date-select:hover,
-.date-select:focus-visible { background-color: var(--accent-ink); }
+.date-trigger:hover,
+.date-trigger[aria-expanded="true"] { background: var(--accent-ink); }
 
-.date-select option { color: var(--ink); background: var(--paper); }
+.date-trigger svg { width: 14px; height: 14px; flex: none; }
+
+.calendar {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 30;
+  width: 292px;
+  padding: 14px 14px 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--paper);
+  box-shadow: var(--shadow-lift);
+}
+
+.calendar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.calendar-head strong {
+  font-family: var(--serif);
+  font-size: .95rem;
+  font-weight: 700;
+}
+
+.calendar-nav {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--hairline);
+  border-radius: 50%;
+  color: var(--ink-2);
+  background: var(--paper-2);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: all .18s ease;
+}
+
+.calendar-nav:hover:not(:disabled) { border-color: var(--accent-2); color: var(--accent-ink); }
+.calendar-nav:disabled { opacity: .35; cursor: default; }
+
+.calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 3px;
+}
+
+.calendar-weekday {
+  padding: 4px 0 6px;
+  color: var(--muted);
+  font-size: .66rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+.calendar-day {
+  aspect-ratio: 1;
+  border: 0;
+  border-radius: 50%;
+  color: var(--hairline);
+  background: none;
+  font-size: .8rem;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+
+/* 스크랩이 있는 날만 누를 수 있다. */
+.calendar-day.has-data {
+  color: var(--ink);
+  background: var(--accent-wash);
+  font-weight: 700;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+
+.calendar-day.has-data:hover { color: #fff; background: var(--accent-2); }
+.calendar-day.has-data.sun,
+.calendar-weekday.sun { color: var(--error); }
+.calendar-day.has-data.sat,
+.calendar-weekday.sat { color: #4a6a93; }
+.calendar-day.has-data:hover.sun,
+.calendar-day.has-data:hover.sat { color: #fff; }
+
+.calendar-day.selected,
+.calendar-day.selected.sun,
+.calendar-day.selected.sat { color: #fff; background: var(--ink); }
+
+.calendar-day.today { box-shadow: inset 0 0 0 1.5px var(--accent); }
+
+.calendar-hint {
+  margin: 10px 2px 0;
+  color: var(--muted);
+  font-size: .7rem;
+}
 
 /* ── Card ──────────────────────────────────────────────────── */
 .card {
@@ -1001,6 +1094,7 @@ a { color: inherit; }
   .card-head { flex-direction: column; }
   .actions { justify-content: flex-start; }
   .job-card { flex-direction: column; }
+  .calendar { width: min(300px, calc(100vw - 28px)); }
   /* 좁은 화면에서는 스위치를 이름 아래로 내리고, 누르는 자리를 넓힌다. */
   .switch-row { flex-direction: column; align-items: flex-start; gap: 6px; }
   .switch { padding: 9px 0; }

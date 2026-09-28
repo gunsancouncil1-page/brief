@@ -129,23 +129,44 @@ function renderMenu() {
 }
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
+
+// 달력은 날짜 문자열(YYYY-MM-DD)을 현지 날짜로만 다룬다. toISOString()을 거치면
+// 한국 시간에서 하루가 밀린다.
+function parseDate(value) {
+  const [year, month, day] = value.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function isoDate(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function monthStart(date) {
+  return new Date(date.getFullYear(), date.getMonth(), 1);
+}
 
 function dateLabel(value) {
-  const time = new Date(`${value}T00:00:00`);
-  if (Number.isNaN(time.getTime())) return value;
-  return `${value} (${time.toLocaleDateString("ko-KR", { weekday: "short" })})`;
+  if (!DATE_PATTERN.test(value)) return value;
+  return `${value} (${WEEKDAYS[parseDate(value).getDay()]})`;
 }
 
 function viewingLatest() {
   return !state.latestDate || state.reportDate === state.latestDate;
 }
 
+const calendar = { open: false, month: null };
+
+const CALENDAR_ICON =
+  '<svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4">' +
+  '<rect x="2" y="3" width="12" height="11" rx="2"/><path d="M2 6.5h12M5.5 1.5v3M10.5 1.5v3"/></svg>';
+
 function renderDates() {
   if (!state.reportDate) {
     dateRail.innerHTML = '<span class="hint">아직 수집된 자료가 없습니다.</span>';
     return;
   }
-  // 지난 날짜가 보관돼 있으면 골라 볼 수 있게 한다. 없으면 오늘 날짜만 보여 준다.
+  // 지난 날짜가 보관돼 있으면 달력으로 골라 볼 수 있게 한다. 없으면 오늘 날짜만 보여 준다.
   if (state.dates.length <= 1) {
     const stale = state.today && state.reportDate !== state.today;
     dateRail.innerHTML =
@@ -153,25 +174,120 @@ function renderDates() {
       (stale ? '<span class="hint">가장 최근 수집분입니다.</span>' : "");
     return;
   }
-  const options = state.dates
-    .map(
-      (date) =>
-        `<option value="${escapeHtml(date)}" ${date === state.reportDate ? "selected" : ""}>${escapeHtml(dateLabel(date))}</option>`,
-    )
-    .join("");
-  dateRail.innerHTML =
-    `<select class="date-select" id="dateSelect" aria-label="일자 선택">${options}</select>` +
-    (viewingLatest()
-      ? ""
-      : '<button type="button" class="date-chip" id="latestDate">최신 일자로</button>');
+  dateRail.innerHTML = `
+    <div class="date-picker">
+      <button type="button" class="date-trigger" id="dateTrigger"
+        aria-haspopup="dialog" aria-expanded="${calendar.open}" aria-controls="calendar">
+        ${CALENDAR_ICON}<span>${escapeHtml(dateLabel(state.reportDate))}</span>
+      </button>
+      <div class="calendar" id="calendar" role="dialog" aria-label="일자 선택" ${calendar.open ? "" : "hidden"}></div>
+    </div>
+    ${viewingLatest() ? "" : '<button type="button" class="date-chip" id="latestDate">최신 일자로</button>'}`;
 
-  el("dateSelect").addEventListener("change", (event) => selectDate(event.target.value));
+  el("dateTrigger").addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleCalendar(!calendar.open);
+  });
   const latest = el("latestDate");
   if (latest) latest.addEventListener("click", () => selectDate(state.latestDate));
+  if (calendar.open) renderCalendar();
 }
 
+function toggleCalendar(open) {
+  calendar.open = open;
+  if (open) calendar.month = monthStart(parseDate(state.reportDate));
+  const box = el("calendar");
+  const trigger = el("dateTrigger");
+  if (!box || !trigger) return;
+  box.hidden = !open;
+  trigger.setAttribute("aria-expanded", String(open));
+  if (open) {
+    renderCalendar();
+    const selected = box.querySelector(".calendar-day.selected");
+    if (selected) selected.focus();
+  }
+}
+
+function renderCalendar() {
+  const box = el("calendar");
+  if (!box || !calendar.month) return;
+
+  const available = new Set(state.dates);
+  const first = calendar.month;
+  const earliest = monthStart(parseDate(state.dates[state.dates.length - 1]));
+  const newest = monthStart(parseDate(state.dates[0]));
+  const lastDay = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+
+  const cells = [];
+  for (let blank = 0; blank < first.getDay(); blank += 1) {
+    cells.push('<span class="calendar-blank"></span>');
+  }
+  for (let day = 1; day <= lastDay; day += 1) {
+    const date = new Date(first.getFullYear(), first.getMonth(), day);
+    const value = isoDate(date);
+    const has = available.has(value);
+    const classes = ["calendar-day"];
+    if (has) classes.push("has-data");
+    if (value === state.reportDate) classes.push("selected");
+    if (value === state.today) classes.push("today");
+    if (date.getDay() === 0) classes.push("sun");
+    if (date.getDay() === 6) classes.push("sat");
+    const label = `${date.getFullYear()}년 ${date.getMonth() + 1}월 ${day}일 (${WEEKDAYS[date.getDay()]})${has ? "" : " · 스크랩 없음"}`;
+    cells.push(
+      `<button type="button" class="${classes.join(" ")}" data-date="${value}" aria-label="${label}"` +
+        `${value === state.reportDate ? ' aria-current="date"' : ""}${has ? "" : " disabled"}>${day}</button>`,
+    );
+  }
+
+  box.innerHTML = `
+    <div class="calendar-head">
+      <button type="button" class="calendar-nav" data-step="-1" aria-label="이전 달" ${first > earliest ? "" : "disabled"}>‹</button>
+      <strong>${first.getFullYear()}년 ${first.getMonth() + 1}월</strong>
+      <button type="button" class="calendar-nav" data-step="1" aria-label="다음 달" ${first < newest ? "" : "disabled"}>›</button>
+    </div>
+    <div class="calendar-grid">
+      ${WEEKDAYS.map((name, index) => `<span class="calendar-weekday${index === 0 ? " sun" : index === 6 ? " sat" : ""}">${name}</span>`).join("")}
+      ${cells.join("")}
+    </div>
+    <p class="calendar-hint">색이 칠해진 날짜에 스크랩이 있습니다.</p>`;
+
+  box.querySelectorAll("[data-step]").forEach((button) =>
+    button.addEventListener("click", (event) => {
+      // 달을 넘기면 달력을 다시 그린다. 바깥 클릭으로 잘못 알고 닫히지 않게 한다.
+      event.stopPropagation();
+      const step = Number(button.dataset.step);
+      calendar.month = new Date(calendar.month.getFullYear(), calendar.month.getMonth() + step, 1);
+      renderCalendar();
+    }),
+  );
+  box.querySelectorAll(".calendar-day.has-data").forEach((button) =>
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      selectDate(button.dataset.date);
+    }),
+  );
+}
+
+// 달력 바깥을 누르거나 Esc를 누르면 닫는다.
+document.addEventListener("click", (event) => {
+  if (!calendar.open || !event.target.isConnected) return;
+  if (event.target.closest(".date-picker")) return;
+  toggleCalendar(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !calendar.open) return;
+  toggleCalendar(false);
+  const trigger = el("dateTrigger");
+  if (trigger) trigger.focus();
+});
+
 async function selectDate(date) {
-  if (!date || date === state.reportDate || !state.dates.includes(date)) return;
+  if (!date || !state.dates.includes(date)) return;
+  calendar.open = false;
+  if (date === state.reportDate) {
+    renderDates();
+    return;
+  }
   state.reportDate = date;
   // 주소에 날짜를 남겨, 그 날짜 화면을 그대로 공유하거나 즐겨찾기할 수 있게 한다.
   const hash = viewingLatest() ? "" : `#${date}`;
