@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -14,8 +15,72 @@ from app.sections import menu_payload, section_payload
 TEMPLATES = PROJECT_ROOT / "app" / "templates"
 STATIC = PROJECT_ROOT / "app" / "static"
 
-# 정적 사이트에 실을 날짜 수. 지난 자료는 이 개수만큼만 함께 올라간다.
-MAX_DATES = 30
+# 지난 날짜는 지우지 않고 모두 남긴다. 날짜 하나가 수십 KB라 몇 해를
+# 쌓아도 GitHub Pages 한도(1GB)에 한참 못 미친다.
+
+
+DATE_FILE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
+PUBLIC_FIELDS = ("id", "title", "publisher", "published_at", "source_url", "matched_keywords", "preferred")
+
+
+def sanitize_date_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """지난 날짜 파일도 공개 규칙(제목·언론사·시각·직접링크)만 남긴다.
+
+    보관본은 git 이력이나 이전 빌드에서 가져오므로, 혹시 섞여 있을지 모를
+    본문 같은 필드를 여기서 한 번 더 걷어 낸다.
+    """
+    sections: dict[str, Any] = {}
+    for key, section in (payload.get("sections") or {}).items():
+        articles = [
+            {field: article.get(field) for field in PUBLIC_FIELDS}
+            for article in section.get("articles") or []
+        ]
+        briefing = section.get("briefing")
+        sections[key] = {
+            "approved": True,
+            "report_date": section.get("report_date") or payload.get("report_date"),
+            "published_count": len(articles),
+            "generate_briefing": bool(section.get("generate_briefing")),
+            "articles": articles,
+            "briefing": (
+                {"body": briefing.get("body", ""), "status": briefing.get("status", "complete")}
+                if briefing
+                else None
+            ),
+        }
+    return {"report_date": payload.get("report_date"), "sections": sections}
+
+
+def archived_dates(data_dir: Path) -> list[str]:
+    """보관된 날짜들. 최신이 앞에 온다."""
+    if not data_dir.is_dir():
+        return []
+    return sorted(
+        (path.stem for path in data_dir.iterdir() if DATE_FILE.match(path.name)),
+        reverse=True,
+    )
+
+
+def import_archive(source: Path, data_dir: Path) -> list[str]:
+    """이미 게시된 날짜 파일 가운데 여기 없는 것을 들여온다.
+
+    이 PC의 빌드 폴더가 지워져도, GitHub Pages에 올라가 있는 지난 자료로
+    다시 채울 수 있게 한다.
+    """
+    imported: list[str] = []
+    for report_date in archived_dates(source):
+        target = data_dir / f"{report_date}.json"
+        if target.exists():
+            continue
+        try:
+            payload = json.loads((source / f"{report_date}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        target.write_text(
+            json.dumps(sanitize_date_payload(payload), ensure_ascii=False), encoding="utf-8"
+        )
+        imported.append(report_date)
+    return imported
 
 
 def public_article(article: dict[str, Any]) -> dict[str, Any]:
@@ -68,24 +133,34 @@ def _static_index_html() -> str:
     return html
 
 
-def build_site(database: Database, settings: Settings, destination: Path) -> dict[str, Any]:
-    """승인된 결과를 정적 사이트로 내보낸다. GitHub Pages가 그대로 서비스한다."""
+def build_site(
+    database: Database,
+    settings: Settings,
+    destination: Path,
+    *,
+    archive_dir: Path | None = None,
+) -> dict[str, Any]:
+    """승인된 결과를 정적 사이트로 내보낸다. GitHub Pages가 그대로 서비스한다.
+
+    날짜별 파일은 지우지 않고 쌓아 둔다. 관리자 쪽 자료(DB)는 오늘 몫만 남기고
+    정리하지만, 공개 사이트에서는 지난 날짜를 골라 다시 볼 수 있어야 한다.
+    """
     destination.mkdir(parents=True, exist_ok=True)
     data_dir = destination / "data"
-    if data_dir.exists():
-        shutil.rmtree(data_dir)
-    data_dir.mkdir(parents=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if archive_dir is not None:
+        import_archive(archive_dir, data_dir)
 
-    dates = database.dates()[:MAX_DATES]
-    published_dates: list[str] = []
-    for report_date in dates:
+    for report_date in database.dates():
+        target = data_dir / f"{report_date}.json"
         payload = date_payload(database, report_date)
         if not payload["sections"]:
-            continue  # 승인된 것이 하나도 없는 날짜는 올리지 않는다
-        (data_dir / f"{report_date}.json").write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-        )
-        published_dates.append(report_date)
+            # 승인된 것이 하나도 없는 날짜(검토 대기, 공개 내림)는 올리지 않는다.
+            target.unlink(missing_ok=True)
+            continue
+        target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    published_dates = archived_dates(data_dir)
 
     now = datetime.now(settings.timezone)
     index = {

@@ -4,6 +4,9 @@ const state = {
   tab: null,
   today: null,
   reportDate: null,
+  latestDate: null,
+  // 공개 사이트에 보관된 날짜들(최신이 앞). 서버 화면은 오늘 하나뿐이다.
+  dates: [],
   overview: {},
   // 공개 화면은 중복을 제거한 목록만 보여 준다.
   view: "unique",
@@ -125,16 +128,61 @@ function renderMenu() {
   );
 }
 
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function dateLabel(value) {
+  const time = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(time.getTime())) return value;
+  return `${value} (${time.toLocaleDateString("ko-KR", { weekday: "short" })})`;
+}
+
+function viewingLatest() {
+  return !state.latestDate || state.reportDate === state.latestDate;
+}
+
 function renderDates() {
-  // 공개 화면은 가장 최근 수집분만 보여 준다. 지난 날짜는 관리자 페이지에서 확인한다.
   if (!state.reportDate) {
     dateRail.innerHTML = '<span class="hint">아직 수집된 자료가 없습니다.</span>';
     return;
   }
-  const stale = state.today && state.reportDate !== state.today;
+  // 지난 날짜가 보관돼 있으면 골라 볼 수 있게 한다. 없으면 오늘 날짜만 보여 준다.
+  if (state.dates.length <= 1) {
+    const stale = state.today && state.reportDate !== state.today;
+    dateRail.innerHTML =
+      `<span class="date-chip active">${escapeHtml(state.reportDate)}</span>` +
+      (stale ? '<span class="hint">가장 최근 수집분입니다.</span>' : "");
+    return;
+  }
+  const options = state.dates
+    .map(
+      (date) =>
+        `<option value="${escapeHtml(date)}" ${date === state.reportDate ? "selected" : ""}>${escapeHtml(dateLabel(date))}</option>`,
+    )
+    .join("");
   dateRail.innerHTML =
-    `<span class="date-chip active">${escapeHtml(state.reportDate)}</span>` +
-    (stale ? '<span class="hint">가장 최근 수집분입니다.</span>' : "");
+    `<select class="date-select" id="dateSelect" aria-label="일자 선택">${options}</select>` +
+    (viewingLatest()
+      ? ""
+      : '<button type="button" class="date-chip" id="latestDate">최신 일자로</button>');
+
+  el("dateSelect").addEventListener("change", (event) => selectDate(event.target.value));
+  const latest = el("latestDate");
+  if (latest) latest.addEventListener("click", () => selectDate(state.latestDate));
+}
+
+async function selectDate(date) {
+  if (!date || date === state.reportDate || !state.dates.includes(date)) return;
+  state.reportDate = date;
+  // 주소에 날짜를 남겨, 그 날짜 화면을 그대로 공유하거나 즐겨찾기할 수 있게 한다.
+  const hash = viewingLatest() ? "" : `#${date}`;
+  history.replaceState(null, "", `${location.pathname}${location.search}${hash}`);
+  renderDates();
+  await loadOverview();
+}
+
+function dateFromHash() {
+  const value = decodeURIComponent(location.hash.replace(/^#/, ""));
+  return DATE_PATTERN.test(value) && state.dates.includes(value) ? value : null;
 }
 
 function renderNote(job) {
@@ -163,6 +211,11 @@ function showSkeleton() {
 
 // 보도자료가 없을 때 공개 화면에 보이는 문구.
 const EMPTY_MESSAGE = "오늘 일자 보도자료는 없습니다.";
+const PAST_EMPTY_MESSAGE = "해당 일자 보도자료는 없습니다.";
+
+function emptyMessage() {
+  return viewingLatest() ? EMPTY_MESSAGE : PAST_EMPTY_MESSAGE;
+}
 
 function showEmpty(title, message = "") {
   // 덧붙일 설명이 없으면 한 줄만 보여 준다.
@@ -174,7 +227,7 @@ function showEmpty(title, message = "") {
 /* ── Articles ─────────────────────────────────────────────── */
 function renderArticles(articles) {
   if (!articles.length) {
-    showEmpty(EMPTY_MESSAGE);
+    showEmpty(emptyMessage());
     return;
   }
   // 관리자가 정한 차례를 그대로 보여 준다(서버가 그 순서로 내려 준다).
@@ -245,11 +298,11 @@ async function render() {
   renderNote(job);
 
   if (!state.reportDate) {
-    showEmpty(EMPTY_MESSAGE);
+    showEmpty(emptyMessage());
     return;
   }
   if (!job) {
-    showEmpty(EMPTY_MESSAGE);
+    showEmpty(emptyMessage());
     return;
   }
   if (!job.approved) {
@@ -268,6 +321,10 @@ async function render() {
   try {
     if (tab.view === "briefing") {
       const data = await source.briefing(state.reportDate, tab.section);
+      if ((data.briefing.body || "").trim() === EMPTY_MESSAGE) {
+        showEmpty(emptyMessage());
+        return;
+      }
       const fallback =
         data.briefing.status === "fallback"
           ? '<p class="notice warning">로컬 LLM 응답을 받지 못해 확인 목록으로 대체되었습니다.</p>'
@@ -280,7 +337,7 @@ async function render() {
     }
   } catch (error) {
     if (error.status === 404) {
-      showEmpty(EMPTY_MESSAGE);
+      showEmpty(emptyMessage());
       return;
     }
     contentEl.innerHTML = `<p class="error-block">${escapeHtml(error.message)}</p>`;
@@ -311,7 +368,11 @@ async function initialize() {
     state.collectAt = menu.collect_at;
     state.tab = menu.menu[0].key;
     state.today = menu.today;
-    state.reportDate = menu.latest_date;
+    state.latestDate = menu.latest_date;
+    state.dates = Array.isArray(menu.dates) && menu.dates.length
+      ? menu.dates
+      : menu.latest_date ? [menu.latest_date] : [];
+    state.reportDate = dateFromHash() || menu.latest_date;
     state.builtAt = menu.built_at || null;
   } catch (error) {
     contentEl.innerHTML = `<p class="error-block">${escapeHtml(error.message)}</p>`;
@@ -324,5 +385,11 @@ async function initialize() {
   const stamp = el("buildStamp");
   if (stamp && state.builtAt) stamp.textContent = `${state.builtAt.replace("T", " ")} 기준`;
 }
+
+window.addEventListener("hashchange", () => {
+  const date = dateFromHash();
+  if (date) selectDate(date);
+  else if (!location.hash && state.latestDate) selectDate(state.latestDate);
+});
 
 initialize();

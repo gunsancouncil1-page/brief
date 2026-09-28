@@ -1663,3 +1663,97 @@ def test_empty_day_briefing_uses_the_same_sentence_as_the_other_tabs():
     assert result["status"] == "complete"
     # 안내 문구만 남기고 제목 줄은 붙이지 않는다.
     assert "#" not in result["body"]
+
+
+def _archived_day(report_date: str, *, extra: dict | None = None) -> dict:
+    article = {
+        "id": f"old-{report_date}",
+        "title": "군산시의회, 임시회 폐회",
+        "publisher": "군산뉴스",
+        "published_at": f"{report_date}T09:00:00+09:00",
+        "source_url": f"https://www.newsgunsan.com/ngnews/ngNewsView.php?pid={report_date}",
+        "matched_keywords": ["군산시의회"],
+        "preferred": 1,
+        **(extra or {}),
+    }
+    return {
+        "report_date": report_date,
+        "sections": {
+            "council": {
+                "approved": True,
+                "report_date": report_date,
+                "published_count": 1,
+                "generate_briefing": True,
+                "articles": [article],
+                "briefing": {"body": "# 한눈에 보기\n임시회 폐회 [기사 1]", "status": "complete"},
+            }
+        },
+    }
+
+
+def test_static_site_keeps_every_published_day(tmp_path: Path):
+    """오늘 수집이 끝나도 지난 날짜는 공개 사이트에 그대로 남는다."""
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+
+    # GitHub Pages에 이미 올라가 있던 지난 날짜들.
+    published = tmp_path / "gh-pages" / "data"
+    published.mkdir(parents=True)
+    (published / "2026-08-21.json").write_text(
+        json.dumps(_archived_day("2026-08-21")), encoding="utf-8"
+    )
+    # 예전 파일에 본문이 섞여 있었더라도 공개본에는 실리지 않아야 한다.
+    (published / "2026-08-24.json").write_text(
+        json.dumps(_archived_day("2026-08-24", extra={"content": "기사 본문 전체"}), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (published / "index.json").write_text("{}", encoding="utf-8")
+    (published / "memo.txt").write_text("날짜 파일이 아님", encoding="utf-8")
+
+    # 오늘(DB)에는 승인된 군산시의회 한 건.
+    job = make_job(database, section="council", report_date="2026-08-25")
+    database.upsert_article(
+        sample_article(job["id"], "today", "https://www.jjan.kr/1", "전북일보", DISTINCT_BODIES[0])
+    )
+    database.set_approved(job["id"], True)
+
+    site = tmp_path / "site"
+    result = build_site(database, settings, site, archive_dir=published)
+    assert result["dates"] == ["2026-08-25", "2026-08-24", "2026-08-21"]
+    assert result["latest_date"] == "2026-08-25"
+
+    index = json.loads((site / "data" / "index.json").read_text(encoding="utf-8"))
+    assert index["dates"] == ["2026-08-25", "2026-08-24", "2026-08-21"]
+    assert not (site / "data" / "memo.txt").exists()
+
+    old = json.loads((site / "data" / "2026-08-24.json").read_text(encoding="utf-8"))
+    article = old["sections"]["council"]["articles"][0]
+    assert "content" not in article
+    assert article["source_url"].startswith("https://www.newsgunsan.com/")
+    assert old["sections"]["council"]["briefing"]["body"].startswith("# 한눈에 보기")
+
+    # 보관본 없이 다시 빌드해도(평소 게시), 이미 쌓인 날짜는 지워지지 않는다.
+    again = build_site(database, settings, site)
+    assert again["dates"] == ["2026-08-25", "2026-08-24", "2026-08-21"]
+
+
+def test_unapproved_day_is_taken_off_the_site(tmp_path: Path):
+    """공개를 내린 날짜는 보관 목록에서도 빠진다."""
+    settings = make_settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    job = make_job(database, section="council", report_date="2026-08-25")
+    database.upsert_article(
+        sample_article(job["id"], "a", "https://www.jjan.kr/1", "전북일보", DISTINCT_BODIES[0])
+    )
+    database.set_approved(job["id"], True)
+
+    site = tmp_path / "site"
+    assert build_site(database, settings, site)["dates"] == ["2026-08-25"]
+
+    database.set_approved(job["id"], False)
+    result = build_site(database, settings, site)
+    assert result["dates"] == []
+    assert result["latest_date"] is None
+    assert not (site / "data" / "2026-08-25.json").exists()

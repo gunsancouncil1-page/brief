@@ -216,6 +216,33 @@ a { color: inherit; }
   background: var(--ink);
 }
 
+/* 지난 날짜를 고르는 목록. 선택된 날짜 칩과 같은 모양으로 보이게 한다. */
+.date-select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 7px 34px 7px 14px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: #fff;
+  background-color: var(--ink);
+  /* 아래쪽 화살표. 글자색과 같은 흰색으로 그린다. */
+  background-image:
+    linear-gradient(45deg, transparent 50%, #fff 50%),
+    linear-gradient(135deg, #fff 50%, transparent 50%);
+  background-position: calc(100% - 17px) 50%, calc(100% - 12px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  font-size: .8rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.date-select:hover,
+.date-select:focus-visible { background-color: var(--accent-ink); }
+
+.date-select option { color: var(--ink); background: var(--paper); }
+
 /* ── Card ──────────────────────────────────────────────────── */
 .card {
   padding: 30px 32px 34px;

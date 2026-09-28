@@ -93,8 +93,13 @@ def publish(
     database: Database, settings: Settings, *, push: bool = True
 ) -> dict[str, Any]:
     """승인분을 정적 사이트로 만들고 gh-pages 브랜치에 올린다."""
+    if not (PROJECT_ROOT / ".git").exists():
+        raise PublishError("git 저장소가 아닙니다. 먼저 저장소를 연결하세요.")
+
+    # 이미 게시된 지난 날짜를 먼저 받아 와야, 새로 만든 사이트에 함께 남는다.
+    _ensure_worktree()
     site = settings.data_dir / "site"
-    built = build_site(database, settings, site)
+    built = build_site(database, settings, site, archive_dir=WORKTREE / "data")
     result: dict[str, Any] = {
         **built,
         "committed": False,
@@ -103,10 +108,6 @@ def publish(
         "message": "",
     }
 
-    if not (PROJECT_ROOT / ".git").exists():
-        raise PublishError("git 저장소가 아닙니다. 먼저 저장소를 연결하세요.")
-
-    _ensure_worktree()
     _copy_site(site)
     git("add", "-A", cwd=WORKTREE)
     if not git("status", "--porcelain", cwd=WORKTREE).stdout.strip():
