@@ -22,7 +22,13 @@ from rapidfuzz import fuzz
 
 from app.config import Settings
 from app.database import Database
-from app.sections import SiteListing, is_excluded_title, is_excluded_url, publisher_for
+from app.sections import (
+    SiteListing,
+    is_excluded_title,
+    is_excluded_url,
+    public_article_url,
+    publisher_for,
+)
 from app.services.images import collect_article_images
 
 
@@ -544,7 +550,9 @@ async def fetch_linked_article(
     content = re.sub(r"\n{3,}", "\n\n", strip_ad_lines(content)).strip()
     published_at = metadata["published_at"] or datetime.now(UTC).astimezone(timezone)
 
-    article_id = hashlib.sha256(f"{job_id}|{resolved_url}".encode("utf-8")).hexdigest()[:32]
+    # 화면에 실을 주소로 저장한다(군산미래신문은 일반 포트로 열리는 모바일 주소).
+    public_url = public_article_url(resolved_url)
+    article_id = hashlib.sha256(f"{job_id}|{public_url}".encode("utf-8")).hexdigest()[:32]
     signature = normalize_text(f"{metadata['title']} {content[:1200]}")
     return {
         "id": article_id,
@@ -552,7 +560,7 @@ async def fetch_linked_article(
         "report_date": report_date,
         "title": metadata["title"],
         "publisher": metadata["publisher"],
-        "source_url": resolved_url,
+        "source_url": public_url,
         "published_at": published_at.isoformat(),
         "scraped_at": datetime.now(UTC).isoformat(),
         "summary": content[:280],
@@ -678,7 +686,9 @@ class GoogleNewsRssCollector:
         if matched is None:
             return None
 
-        article_id = hashlib.sha256(f"{job_id}|{resolved_url}".encode("utf-8")).hexdigest()[:32]
+        # 화면에 실을 주소로 저장한다(군산미래신문은 일반 포트로 열리는 모바일 주소).
+        public_url = public_article_url(resolved_url)
+        article_id = hashlib.sha256(f"{job_id}|{public_url}".encode("utf-8")).hexdigest()[:32]
 
         # 키워드 검증을 통과한 기사만 이미지를 내려받는다.
         images: list[dict[str, Any]] = []
@@ -699,7 +709,7 @@ class GoogleNewsRssCollector:
             "title": title,
             # RSS가 이름 대신 호스트만 줄 때가 있다. 아는 매체면 제 이름으로 적는다.
             "publisher": publisher,
-            "source_url": resolved_url,
+            "source_url": public_url,
             "published_at": published_at.isoformat(),
             "scraped_at": datetime.now(UTC).isoformat(),
             "summary": summary,
@@ -845,7 +855,9 @@ class SiteListingCollector:
         if matched is None:
             return None
 
-        article_id = hashlib.sha256(f"{job_id}|{resolved_url}".encode("utf-8")).hexdigest()[:32]
+        # 화면에 실을 주소로 저장한다(군산미래신문은 일반 포트로 열리는 모바일 주소).
+        public_url = public_article_url(resolved_url)
+        article_id = hashlib.sha256(f"{job_id}|{public_url}".encode("utf-8")).hexdigest()[:32]
         signature = normalize_text(f"{metadata['title']} {content[:1200]}")
         return {
             "id": article_id,
@@ -853,7 +865,7 @@ class SiteListingCollector:
             "report_date": end.date().isoformat(),
             "title": metadata["title"],
             "publisher": metadata["publisher"],
-            "source_url": resolved_url,
+            "source_url": public_url,
             "published_at": published_at.isoformat(),
             "scraped_at": datetime.now(UTC).isoformat(),
             "summary": content[:280],

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, urlencode
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,28 @@ def is_excluded_url(url: str) -> bool:
 def is_excluded_title(title: str) -> bool:
     stripped = (title or "").strip()
     return any(stripped.startswith(mark) for mark in EXCLUDED_TITLE_MARKS)
+
+
+
+# 군산미래신문의 PC 지면은 50000번 포트를 쓴다. 관공서 망이나 휴대폰 통신망에서는
+# 이런 포트가 막혀 열리지 않는 경우가 많아, 일반 포트로 열리는 모바일 지면 주소로
+# 바꿔 싣는다. 같은 기사 번호(pid)로 같은 기사가 열린다.
+_KMRNEWS_DESKTOP = re.compile(
+    r"^https?://(?:www\.)?kmrnews\.com(?::\d+)?/ynews/ynews_view\.php\?(?P<query>.+)$",
+    re.IGNORECASE,
+)
+
+
+def public_article_url(url: str) -> str:
+    """기사 주소를 화면에 실을 주소로 바꾼다. 해당 없는 주소는 그대로 둔다."""
+    found = _KMRNEWS_DESKTOP.match(url or "")
+    if not found:
+        return url
+    params = dict(parse_qsl(found.group("query")))
+    if not params.get("pid"):
+        return url
+    query = urlencode({"code": params.get("code", "NS01"), "pid": params["pid"]})
+    return f"https://kmrnews.com/m/newsview_m.htm?{query}"
 
 
 # Google 뉴스가 매체 이름을 주지 않을 때 쓸 이름표.

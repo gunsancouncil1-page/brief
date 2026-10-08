@@ -1757,3 +1757,51 @@ def test_unapproved_day_is_taken_off_the_site(tmp_path: Path):
     assert result["dates"] == []
     assert result["latest_date"] is None
     assert not (site / "data" / "2026-08-25.json").exists()
+
+
+def test_kmrnews_links_use_the_mobile_address():
+    """군산미래신문은 50000번 포트 대신 일반 포트로 열리는 모바일 주소로 싣는다."""
+    from app.sections import public_article_url
+
+    desktop = "https://kmrnews.com:50000/ynews/ynews_view.php?code=NS01&pid=90068&PHPSESSID=abc"
+    assert public_article_url(desktop) == "https://kmrnews.com/m/newsview_m.htm?code=NS01&pid=90068"
+    # www, http, 다른 분류 코드도 같은 규칙으로 바뀐다.
+    assert (
+        public_article_url("http://www.kmrnews.com:50000/ynews/ynews_view.php?pid=7&code=NS02")
+        == "https://kmrnews.com/m/newsview_m.htm?code=NS02&pid=7"
+    )
+    # 이미 모바일 주소이거나 다른 매체 주소는 그대로 둔다.
+    mobile = "https://kmrnews.com/m/newsview_m.htm?code=NS01&pid=90068"
+    assert public_article_url(mobile) == mobile
+    other = "https://www.newsgunsan.com/ngnews/ngNewsView.php?code=NG2&pid=90443"
+    assert public_article_url(other) == other
+
+
+def test_listing_collector_stores_the_mobile_kmrnews_link(tmp_path: Path):
+    """지면은 PC 주소로 읽어도, 저장·공개되는 링크는 모바일 주소다."""
+    seoul = ZoneInfo("Asia/Seoul")
+    start = datetime(2026, 10, 7, 9, 0, tzinfo=seoul)
+    end = datetime(2026, 10, 8, 5, 0, tzinfo=seoul)
+    listing_url = "https://kmrnews.com:50000/ynews/ynews_list.php?code=NS01"
+    article_url = "https://kmrnews.com:50000/ynews/ynews_view.php?code=NS01&pid=90540"
+    pages = {
+        listing_url: f'<html><body><a href="{article_url}&PHPSESSID=x">기사</a></body></html>',
+        article_url: """<html><head><title>군산시의회, 연구단체 7곳 연구활동 본격 돌입</title></head>
+        <body><p>한정근 기자 / 2026-10-07 17:33:00</p>
+        <p>군산시의회 의원 연구단체 7곳이 연구활동에 들어갔다.</p></body></html>""",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = pages.get(str(request.url))
+        return httpx.Response(200, html=page) if page else httpx.Response(404)
+
+    collector = SiteListingCollector(replace(make_settings(tmp_path), rss_enabled=True))
+    listing = SiteListing("군산미래신문", listing_url, "ynews_view.php")
+    spec = SearchSpec(keywords=("군산시의회",), preferred_sites=LOCAL_PRESS)
+    found = asyncio.run(
+        _with_client(_mock_client_factory(handler), collector, (listing,), spec, start=start, end=end)
+    )
+    assert [article["source_url"] for article in found] == [
+        "https://kmrnews.com/m/newsview_m.htm?code=NS01&pid=90540"
+    ]
+    assert found[0]["publisher"] == "군산미래신문"
